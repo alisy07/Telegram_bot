@@ -46,12 +46,12 @@ def create_client(api_id=None, api_hash=None):
             return TelegramClient(config["session_name"], api_id, api_hash).start(bot_token=BOT_TOKEN)
         else:
             logging.info("🔹 تشغيل بوت مؤقت بدون api_id/api_hash")
-            return TelegramClient("temp_session", 11111, "temp_hash").start(bot_token=BOT_TOKEN)
+            return None  # لا ننشئ client مؤقت لأنه يسبب خطأ على Render
     except Exception as e:
         logging.exception("خطأ عند إنشاء العميل")
         return None
 
-client = create_client()  # مؤقت حتى يدخل المستخدم api_id/api_hash
+client = create_client(config["api_id"], config["api_hash"])
 
 def save_config():
     with open(CONFIG_FILE, "w") as f:
@@ -99,21 +99,24 @@ if client:
 
     @client.on(events.NewMessage(pattern="/setapi"))
     async def handle_setapi(event):
-        global client   # ✅ إعلان global في البداية
+        global client
         user_id = event.sender_id
         config["owner_id"] = user_id
-        await event.respond("💬 أدخل **api_id**:")
-        async with client.conversation(user_id) as conv:
-            m1 = await conv.get_response()
-            config["api_id"] = int(m1.text.strip())
-            await event.respond("💬 أدخل **api_hash**:")
-            m2 = await conv.get_response()
-            config["api_hash"] = m2.text.strip()
-            save_config()
-            await event.respond("✅ تم حفظ api_id و api_hash. سيتم إعادة تشغيل البوت الآن.")
-            client.disconnect()
-            client = create_client(config["api_id"], config["api_hash"])
-            print("🔹 Telegram client recreated with real API credentials.")
+        await event.respond("💬 أدخل api_id (رقم فقط):")
+        api_id_msg = await client.wait_for(events.NewMessage(from_users=user_id))
+        config["api_id"] = int(api_id_msg.text.strip())
+
+        await event.respond("💬 أدخل api_hash:")
+        api_hash_msg = await client.wait_for(events.NewMessage(from_users=user_id))
+        config["api_hash"] = api_hash_msg.text.strip()
+
+        save_config()
+        await event.respond("✅ تم حفظ api_id و api_hash. سيتم إعادة تشغيل البوت الآن.")
+
+        if client.is_connected():
+            await client.disconnect()
+        client = create_client(config["api_id"], config["api_hash"])
+        print("🔹 Telegram client recreated with real API credentials.")
 
     @client.on(events.NewMessage(pattern="/start"))
     async def handle_start(event):
@@ -129,19 +132,18 @@ if client:
     @client.on(events.CallbackQuery(data=b"new"))
     async def handle_new_cb(event):
         await event.respond("💬 أدخل اسم القناة:")
-        async with client.conversation(event.sender_id) as conv:
-            ch = await conv.get_response()
-            channel_name = ch.text.strip()
-            await event.respond("🤖 أدخل اسم البوت الهدف:")
-            bt = await conv.get_response()
-            bot_target = bt.text.strip()
-            try:
-                cursor.execute("INSERT INTO channels(channel_name, bot_target, active, created_at) VALUES (?, ?, 0, ?)",
-                               (channel_name, bot_target, datetime.utcnow().isoformat()))
-                conn.commit()
-                await event.respond(f"✅ تم حفظ {channel_name} -> {bot_target}")
-            except sqlite3.IntegrityError:
-                await event.respond("القناة موجودة بالفعل")
+        api_msg = await client.wait_for(events.NewMessage(from_users=event.sender_id))
+        channel_name = api_msg.text.strip()
+        await event.respond("🤖 أدخل اسم البوت الهدف:")
+        bot_msg = await client.wait_for(events.NewMessage(from_users=event.sender_id))
+        bot_target = bot_msg.text.strip()
+        try:
+            cursor.execute("INSERT INTO channels(channel_name, bot_target, active, created_at) VALUES (?, ?, 0, ?)",
+                           (channel_name, bot_target, datetime.utcnow().isoformat()))
+            conn.commit()
+            await event.respond(f"✅ تم حفظ {channel_name} -> {bot_target}")
+        except sqlite3.IntegrityError:
+            await event.respond("القناة موجودة بالفعل")
 
     @client.on(events.CallbackQuery)
     async def handle_channel_cb(event):
