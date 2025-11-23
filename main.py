@@ -99,6 +99,7 @@ if client:
 
     @client.on(events.NewMessage(pattern="/setapi"))
     async def handle_setapi(event):
+        global client   # ✅ إعلان global في البداية
         user_id = event.sender_id
         config["owner_id"] = user_id
         await event.respond("💬 أدخل **api_id**:")
@@ -110,8 +111,6 @@ if client:
             config["api_hash"] = m2.text.strip()
             save_config()
             await event.respond("✅ تم حفظ api_id و api_hash. سيتم إعادة تشغيل البوت الآن.")
-            # إعادة إنشاء العميل الرئيسي
-            global client
             client.disconnect()
             client = create_client(config["api_id"], config["api_hash"])
             print("🔹 Telegram client recreated with real API credentials.")
@@ -261,4 +260,4 @@ print("🚀 Bot + Dashboard ready!")
 if client:
     client.run_until_disconnected()
 else:
-    print("⚠ Telegram client not started — enter api_id and api_hash via /setapi after adding BOT_TOKEN in Environment Variables")
+    print("⚠ Telegram client not started — أدخل api_id و api_hash عبر /setapi بعد رفع BOT_TOKEN")
