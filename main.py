@@ -187,7 +187,7 @@ async def watcher(event):
     await send_to_target(cleaned, active_channels[src])
 
 # ======= Flask web UI =======
-app = Flask(name)
+app = Flask(__name__)
 TEMPLATE = """
 <!doctype html>
 <title>Telegram Forward Bot Dashboard</title>
