@@ -1,31 +1,49 @@
-import os, json, sqlite3, logging, re, threading
+"""
+Telegram Forwarder with Web Dashboard (Bot-token-first flow)
+
+- Uses python-telegram-bot (for bot commands) so the bot works with BOT_TOKEN only.
+- When user provides api_id and api_hash via /setapi, a Telethon client is started to monitor channels.
+- Flask provides a simple web dashboard to add/delete/start/stop channels.
+- SQLite stores channels and their active state.
+
+Instructions:
+- Set BOT_TOKEN environment variable on Render.
+- Deploy project and access web dashboard via Render URL.
+- Use the Telegram bot to send /setapi to enter api_id and api_hash (from my.telegram.org).
+"""
+
+import os, json, sqlite3, logging, re, threading, asyncio
 from datetime import datetime
-from telethon import TelegramClient, events, Button
 from flask import Flask, render_template_string, request, redirect, url_for
-import asyncio
+
+# python-telegram-bot for bot commands (works with BOT_TOKEN only)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler, CallbackQueryHandler
+
+# Telethon for monitoring once api_id/api_hash provided
+from telethon import TelegramClient, events
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s — %(levelname)s — %(message)s')
 
 CONFIG_FILE = "config.json"
 DB_PATH = "bot.db"
 WEB_HOST = "0.0.0.0"
-WEB_PORT = int(os.environ.get("PORT", 10000))
+WEB_PORT = int(os.environ.get("PORT", "10000"))
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
-    logging.warning("⚠ BOT_TOKEN غير موجود في Environment Variables")
+    logging.warning("BOT_TOKEN not set in environment variables. The bot won't start without it.")
 
-# ====== load/create config.json ======
+# ======= load/create config.json =======
 if not os.path.exists(CONFIG_FILE):
-    config = {"api_id": 0, "api_hash": "", "owner_id": 0, "session_name": "session"}
+    config = {"api_id": 0, "api_hash": "", "session_name": "session", "owner_id": 0}
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 else:
     with open(CONFIG_FILE, "r") as f:
         config = json.load(f)
 
-# ====== SQLite DB ======
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+# ======= DB setup =======
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
@@ -39,34 +57,20 @@ CREATE TABLE IF NOT EXISTS channels(
 """)
 conn.commit()
 
-# ====== Active channels dict ======
+# Active channels in memory
 active_channels = {}
 cursor.execute("SELECT channel_name, bot_target FROM channels WHERE active=1")
 for ch, bt in cursor.fetchall():
     active_channels[ch] = bt
 
-# ====== Telegram client ======
-client = None
-
-def create_client(api_id=None, api_hash=None):
-    global client
-    try:
-        if api_id and api_hash:
-            logging.info("🟢 تشغيل البوت ببيانات API الحقيقية")
-            client = TelegramClient(config["session_name"], api_id, api_hash).start(bot_token=BOT_TOKEN)
-            return client
-        else:
-            logging.info("🔹 Telegram client غير موجود بعد — أدخل /setapi لإعداد API")
-            return None
-    except Exception as e:
-        logging.exception("خطأ عند إنشاء العميل")
-        return None
+# Telethon client placeholder
+tele_client = None
+tele_loop = None
 
 def save_config():
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 
-# ====== تنظيف الرسائل ======
 def clean_text(text: str) -> str:
     lines = text.splitlines()
     first_english_line = None
@@ -85,19 +89,7 @@ def clean_text(text: str) -> str:
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
-async def send_to_target(text, bot_target):
-    if not bot_target:
-        return "no target"
-    if not bot_target.startswith("@"):
-        bot_target = f"@{bot_target}"
-    try:
-        await client.send_message(bot_target, text)
-        return "ok"
-    except Exception as e:
-        logging.exception("send error")
-        return str(e)
-
-# ====== Flask Web UI ======
+# ========= Flask dashboard ==========
 app = Flask(__name__)
 TEMPLATE = """
 <!doctype html>
@@ -124,13 +116,14 @@ TEMPLATE = """
 {% endfor %}
 </table>
 <hr>
-<p>ادخل api_id و api_hash عبر /setapi في Telegram بعد رفع BOT_TOKEN في Environment Variables.</p>
+<p>Use the Telegram bot to set api_id/api_hash via <code>/setapi</code>. BOT_TOKEN must be set as an environment variable.</p>
 """
 
 @app.route("/")
 def index():
-    cursor.execute("SELECT id, channel_name, bot_target, active FROM channels ORDER BY id DESC")
-    rows = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT id, channel_name, bot_target, active FROM channels ORDER BY id DESC")
+    rows = cur.fetchall()
     return render_template_string(TEMPLATE, rows=rows)
 
 @app.route("/add", methods=["POST"])
@@ -171,104 +164,159 @@ def toggle(id):
     conn.commit()
     return redirect(url_for("index"))
 
+# ========= Bot (python-telegram-bot) handlers ==========
+SETAPI_APIID, SETAPI_APIHASH = range(2)
+
+def start_command(update: Update, context: CallbackContext):
+    kb = [[InlineKeyboardButton("New", callback_data="new")]]
+    # add channels as buttons
+    cursor.execute("SELECT channel_name FROM channels ORDER BY id DESC")
+    for (ch,) in cursor.fetchall():
+        kb.append([InlineKeyboardButton(ch, callback_data=ch)])
+    update.message.reply_text("Choose channel or create new:", reply_markup=InlineKeyboardMarkup(kb))
+
+def setapi_start(update: Update, context: CallbackContext):
+    update.message.reply_text("Send api_id (number):")
+    return SETAPI_APIID
+
+def setapi_apiid(update: Update, context: CallbackContext):
+    try:
+        api_id = int(update.message.text.strip())
+    except:
+        update.message.reply_text("api_id must be a number. Send /setapi to try again.")
+        return ConversationHandler.END
+    context.user_data["api_id"] = api_id
+    update.message.reply_text("Send api_hash:")
+    return SETAPI_APIHASH
+
+def setapi_apihash(update: Update, context: CallbackContext):
+    api_hash = update.message.text.strip()
+    context.user_data["api_hash"] = api_hash
+    # save to config and start telethon
+    config["api_id"] = context.user_data["api_id"]
+    config["api_hash"] = context.user_data["api_hash"]
+    save_config()
+    update.message.reply_text("Saved api_id and api_hash. Attempting to start Telethon client...")
+    # start telethon client in background
+    threading.Thread(target=start_telethon_background, daemon=True).start()
+    return ConversationHandler.END
+
+def button_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    data = query.data
+    query.answer()
+    if data == "new":
+        query.message.reply_text("Send channel username (without @):")
+        context.user_data["adding_channel"] = True
+    else:
+        # toggle active
+        cursor.execute("SELECT bot_target, active FROM channels WHERE channel_name=?", (data,))
+        row = cursor.fetchone()
+        if not row:
+            query.message.reply_text("Channel not found.")
+            return
+        bot_target, active = row
+        if active:
+            active_channels.pop(data, None)
+            cursor.execute("UPDATE channels SET active=0 WHERE channel_name=?", (data,))
+            conn.commit()
+            query.message.reply_text(f"Stopped watching {data}")
+        else:
+            active_channels[data] = bot_target
+            cursor.execute("UPDATE channels SET active=1 WHERE channel_name=?", (data,))
+            conn.commit()
+            query.message.reply_text(f"Started watching {data}")
+
+def text_message_handler(update: Update, context: CallbackContext):
+    # used for adding channel after pressing New
+    if context.user_data.get("adding_channel"):
+        channel = update.message.text.strip()
+        context.user_data["adding_channel"] = False
+        update.message.reply_text("Send target bot username (without @):")
+        context.user_data["adding_channel_channel"] = channel
+        context.user_data["expect_target"] = True
+        return
+    if context.user_data.get("expect_target"):
+        target = update.message.text.strip()
+        channel = context.user_data.pop("adding_channel_channel", None)
+        context.user_data["expect_target"] = False
+        try:
+            cursor.execute("INSERT INTO channels(channel_name, bot_target, active, created_at) VALUES (?, ?, 0, ?)",
+                           (channel, target, datetime.utcnow().isoformat()))
+            conn.commit()
+            update.message.reply_text(f"Saved {channel} -> {target}")
+        except sqlite3.IntegrityError:
+            update.message.reply_text("Channel already exists")
+
+# ========= Start Telethon client (background) =========
+def start_telethon_background():
+    global tele_client, tele_loop
+    if not config.get("api_id") or not config.get("api_hash"):
+        logging.error("api_id/api_hash missing; cannot start Telethon.")
+        return
+    try:
+        tele_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(tele_loop)
+        tele_client = TelegramClient(config["session_name"], config["api_id"], config["api_hash"])
+        tele_loop.run_until_complete(tele_client.start(bot_token=BOT_TOKEN))
+        logging.info("Telethon started. Registering handlers...")
+        # register message handler
+        @tele_client.on(events.NewMessage())
+        async def watcher(event):
+            if not event.chat or not getattr(event.chat, "username", None):
+                return
+            src = event.chat.username
+            if src not in active_channels:
+                return
+            cleaned = clean_text(event.raw_text or "")
+            if not cleaned:
+                return
+            try:
+                await tele_client.send_message(active_channels[src] if active_channels[src].startswith("@") else f"@{active_channels[src]}", cleaned)
+            except Exception:
+                logging.exception("Forward error")
+
+        tele_loop.run_forever()
+    except Exception:
+        logging.exception("Failed to start Telethon client")
+
+# ========= Run Flask and Bot ==========
 def run_flask():
     app.run(host=WEB_HOST, port=WEB_PORT, threaded=True)
 
-threading.Thread(target=run_flask, daemon=True).start()
-print("🚀 Dashboard ready!")
-
-# ====== Telethon handlers (بعد إنشاء client) ======
-async def setup_client_handlers():
-    global client
-    if not client:
+def run_telegram_bot():
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN missing; telegram bot not starting.")
         return
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    @client.on(events.NewMessage(pattern="/setapi"))
-    async def handle_setapi(event):
-        global client
-        user_id = event.sender_id
-        config["owner_id"] = user_id
+    dp.add_handler(CommandHandler("start", start_command))
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("setapi", setapi_start)],
+        states={
+            SETAPI_APIID: [MessageHandler(Filters.text & ~Filters.command, setapi_apiid)],
+            SETAPI_APIHASH: [MessageHandler(Filters.text & ~Filters.command, setapi_apihash)],
+        },
+        fallbacks=[]
+    )
+    dp.add_handler(conv)
+    dp.add_handler(CallbackQueryHandler(button_callback))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_message_handler))
 
-        await event.respond("💬 أدخل api_id:")
-        msg1 = await client.wait_for(events.NewMessage(from_users=user_id))
-        config["api_id"] = int(msg1.text.strip())
+    updater.start_polling()
+    updater.idle()
 
-        await event.respond("💬 أدخل api_hash:")
-        msg2 = await client.wait_for(events.NewMessage(from_users=user_id))
-        config["api_hash"] = msg2.text.strip()
-
-        save_config()
-        await event.respond("✅ تم حفظ api_id و api_hash. سيتم إعادة تشغيل البوت الآن.")
-
-        if client and client.is_connected():
-            await client.disconnect()
-        client = create_client(config["api_id"], config["api_hash"])
-        asyncio.create_task(client.run_until_disconnected())
-
-    @client.on(events.NewMessage(pattern="/start"))
-    async def handle_start(event):
-        user_id = event.sender_id
-        config["owner_id"] = user_id
-        save_config()
-        buttons = [[Button.inline("New", b"new")]]
-        cursor.execute("SELECT channel_name FROM channels ORDER BY id DESC")
-        for (ch,) in cursor.fetchall():
-            buttons.append([Button.inline(ch, ch.encode())])
-        await event.respond("اختر قناة أو أنشئ واحدة:", buttons=buttons)
-
-    @client.on(events.CallbackQuery(data=b"new"))
-    async def handle_new_cb(event):
-        await event.respond("💬 أدخل اسم القناة:")
-        msg = await client.wait_for(events.NewMessage(from_users=event.sender_id))
-        channel_name = msg.text.strip()
-        await event.respond("🤖 أدخل اسم البوت الهدف:")
-        msg2 = await client.wait_for(events.NewMessage(from_users=event.sender_id))
-        bot_target = msg2.text.strip()
+# ========= Main entry ==========
+if __name__ == "__main__":
+    # start flask in thread
+    threading.Thread(target=run_flask, daemon=True).start()
+    # start telegram bot (polling)
+    threading.Thread(target=run_telegram_bot, daemon=True).start()
+    print("Dashboard + Telegram bot started. Use /setapi in Telegram to provide api_id/api_hash.")
+    # keep main thread alive
+    while True:
         try:
-            cursor.execute("INSERT INTO channels(channel_name, bot_target, active, created_at) VALUES (?, ?, 0, ?)",
-                           (channel_name, bot_target, datetime.utcnow().isoformat()))
-            conn.commit()
-            await event.respond(f"✅ تم حفظ {channel_name} -> {bot_target}")
-        except sqlite3.IntegrityError:
-            await event.respond("القناة موجودة بالفعل")
-
-    @client.on(events.CallbackQuery)
-    async def handle_channel_cb(event):
-        name = event.data.decode()
-        cursor.execute("SELECT bot_target, active FROM channels WHERE channel_name=?", (name,))
-        row = cursor.fetchone()
-        if not row:
-            return
-        bot_target, active = row
-        if name in active_channels:
-            active_channels.pop(name, None)
-            cursor.execute("UPDATE channels SET active=0 WHERE channel_name=?", (name,))
-            conn.commit()
-            await event.answer(f"أوقف مراقبة {name}")
-        else:
-            active_channels[name] = bot_target
-            cursor.execute("UPDATE channels SET active=1 WHERE channel_name=?", (name,))
-            conn.commit()
-            await event.answer(f"بدأ مراقبة {name}")
-
-    @client.on(events.NewMessage())
-    async def watcher(event):
-        if not event.chat or not getattr(event.chat, "username", None):
-            return
-        src = event.chat.username
-        if src not in active_channels:
-            return
-        text = (event.raw_text or "").strip()
-        if not text:
-            return
-        cleaned = clean_text(text)
-        if not cleaned:
-            return
-        await send_to_target(cleaned, active_channels[src])
-
-# ====== تشغيل client ======
-if client:
-    asyncio.get_event_loop().run_until_complete(setup_client_handlers())
-    client.run_until_disconnected()
-else:
-    print("⚠ Telegram client not started — أدخل /setapi بعد رفع BOT_TOKEN على Render")
+            threading.Event().wait(3600)
+        except KeyboardInterrupt:
+            break
