@@ -10,7 +10,6 @@ DB_PATH = "bot.db"
 WEB_HOST = "0.0.0.0"
 WEB_PORT = int(os.environ.get("PORT", 10000))
 
-# ====== bot_token من Environment ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     logging.warning("⚠ BOT_TOKEN غير موجود في Environment Variables")
@@ -24,7 +23,7 @@ else:
     with open(CONFIG_FILE, "r") as f:
         config = json.load(f)
 
-# ====== قاعدة بيانات SQLite ======
+# ====== SQLite DB ======
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
@@ -39,15 +38,20 @@ CREATE TABLE IF NOT EXISTS channels(
 """)
 conn.commit()
 
-# ====== إنشاء TelegramClient ======
-def create_client():
-    if config["api_id"] and config["api_hash"] and BOT_TOKEN:
-        logging.info("🟢 تشغيل البوت ببيانات API الحقيقية")
-        return TelegramClient(config["session_name"], config["api_id"], config["api_hash"]).start(bot_token=BOT_TOKEN)
-    logging.warning("🔴 api_id أو api_hash غير موجودة بعد، البوت يعمل في وضع الإعداد فقط")
-    return None
+# ====== Telegram client ======
+def create_client(api_id=None, api_hash=None):
+    try:
+        if api_id and api_hash:
+            logging.info("🟢 تشغيل البوت ببيانات API الحقيقية")
+            return TelegramClient(config["session_name"], api_id, api_hash).start(bot_token=BOT_TOKEN)
+        else:
+            logging.info("🔹 تشغيل بوت مؤقت بدون api_id/api_hash")
+            return TelegramClient("temp_session", 11111, "temp_hash").start(bot_token=BOT_TOKEN)
+    except Exception as e:
+        logging.exception("خطأ عند إنشاء العميل")
+        return None
 
-client = create_client()
+client = create_client()  # مؤقت حتى يدخل المستخدم api_id/api_hash
 
 def save_config():
     with open(CONFIG_FILE, "w") as f:
@@ -90,22 +94,28 @@ cursor.execute("SELECT channel_name, bot_target FROM channels WHERE active=1")
 for ch, bt in cursor.fetchall():
     active_channels[ch] = bt
 
-# ====== Telethon handlers (if client exists) ======
+# ====== Telethon handlers ======
 if client:
 
     @client.on(events.NewMessage(pattern="/setapi"))
     async def handle_setapi(event):
         user_id = event.sender_id
         config["owner_id"] = user_id
-        await event.respond("💬 أدخل api_id:")
+        await event.respond("💬 أدخل **api_id**:")
         async with client.conversation(user_id) as conv:
             m1 = await conv.get_response()
             config["api_id"] = int(m1.text.strip())
-            await event.respond("💬 أدخل api_hash:")
+            await event.respond("💬 أدخل **api_hash**:")
             m2 = await conv.get_response()
             config["api_hash"] = m2.text.strip()
             save_config()
-            await event.respond("✅ تم حفظ api_id و api_hash. أعد تشغيل البوت الآن!")
+            await event.respond("✅ تم حفظ api_id و api_hash. سيتم إعادة تشغيل البوت الآن.")
+            # إعادة إنشاء العميل الرئيسي
+            global client
+            client.disconnect()
+            client = create_client(config["api_id"], config["api_hash"])
+            print("🔹 Telegram client recreated with real API credentials.")
+
     @client.on(events.NewMessage(pattern="/start"))
     async def handle_start(event):
         user_id = event.sender_id
@@ -169,7 +179,7 @@ if client:
         await send_to_target(cleaned, active_channels[src])
 
 # ====== Flask web UI ======
-app = Flask(name)
+app = Flask(__name__)
 TEMPLATE = """
 <!doctype html>
 <title>Telegram Forward Bot Dashboard</title>
@@ -203,7 +213,8 @@ def index():
     cursor.execute("SELECT id, channel_name, bot_target, active FROM channels ORDER BY id DESC")
     rows = cursor.fetchall()
     return render_template_string(TEMPLATE, rows=rows)
-    @app.route("/add", methods=["POST"])
+
+@app.route("/add", methods=["POST"])
 def add():
     channel = request.form["channel"].strip()
     bot = request.form["bot"].strip()
@@ -251,4 +262,3 @@ if client:
     client.run_until_disconnected()
 else:
     print("⚠ Telegram client not started — enter api_id and api_hash via /setapi after adding BOT_TOKEN in Environment Variables")
-    
