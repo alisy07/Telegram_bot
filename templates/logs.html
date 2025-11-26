@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Logs</title></head><body>
+<h2>Logs</h2>
+<p><a href="/">Back</a></p>
+<table border=1 cellpadding=6>
+<tr><th>ID</th><th>TS</th><th>Source</th><th>Cleaned</th><th>Target</th><th>Status</th></tr>
+{% for id, ts, source, cleaned, target, status in rows %}
+  <tr>
+    <td>{{ id }}</td><td>{{ ts }}</td><td>{{ source }}</td><td>{{ cleaned }}</td><td>{{ target }}</td><td>{{ status }}</td>
+  </tr>
+{% endfor %}
+</table>
+</body></html>
