@@ -1,6 +1,6 @@
 {
     "admin_username": "Ichancy07",
-    "admin_password_sha256": "d29d835b2d4a035d37ff264f62f27b166ee8bbed0f243999ae8a84162993364d",
+    "admin_password_sha256": "dfcad3ab5cabb8749b174732af6324bd808ae80de9321dd8676d0e7ef6558d6f",
     "bot_token_env_name": "BOT_TOKEN",
     "listen_port": 10000
 }
