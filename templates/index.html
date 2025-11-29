@@ -2,20 +2,123 @@
 <html lang="ar">
 <head>
 <meta charset="UTF-8">
-<title>Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>لوحة التحكم - Telegram Bot</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+body { direction: rtl; }
+.sidebar { height: 100vh; background: #343a40; color: white; padding: 20px; }
+.sidebar a { color: white; display: block; margin: 10px 0; text-decoration: none; }
+.sidebar a:hover { text-decoration: underline; }
+</style>
 </head>
 <body>
-<h2>Dashboard</h2>
-<p>Bot Running: {{ bot_running }}</p>
-<table border="1">
-<tr><th>Channel</th><th>Bot Target</th><th>Active</th></tr>
-{% for row in channels %}
-<tr>
-<td>{{ row[1] }}</td>
-<td>{{ row[2] }}</td>
-<td>{{ row[3] }}</td>
-</tr>
-{% endfor %}
-</table>
+<div class="d-flex">
+  <div class="sidebar">
+    <h4>لوحة التحكم</h4>
+    <a href="#" onclick="showSection('channels')">📺 القنوات</a>
+    <a href="#" onclick="showSection('sessions')">📡 الجلسات</a>
+    <a href="#" onclick="showSection('logs')">📝 السجلات</a>
+    <a href="#" onclick="toggleBot()">🔄 تشغيل/إيقاف البوت</a>
+    <a href="/logout">🚪 تسجيل الخروج</a>
+  </div>
+  <div class="container-fluid p-4">
+    
+    <div id="channels-section">
+      <h3>القنوات</h3>
+      <form id="add-channel-form" class="mb-3">
+        <div class="row g-2">
+          <div class="col"><input type="text" class="form-control" name="channel" placeholder="اسم القناة" required></div>
+          <div class="col"><input type="text" class="form-control" name="bot" placeholder="البوت الهدف" required></div>
+          <div class="col"><button type="submit" class="btn btn-primary">إضافة قناة</button></div>
+        </div>
+      </form>
+      <table class="table table-bordered">
+        <thead>
+          <tr><th>القناة</th><th>البوت الهدف</th><th>الحالة</th><th>إجراءات</th></tr>
+        </thead>
+        <tbody id="channels-table"></tbody>
+      </table>
+    </div>
+    
+    <div id="sessions-section" style="display:none;">
+      <h3>الجلسات</h3>
+      <form id="add-session-form">
+        <div class="row g-2 mb-3">
+          <div class="col"><input type="number" class="form-control" name="api_id" placeholder="API ID" required></div>
+          <div class="col"><input type="text" class="form-control" name="api_hash" placeholder="API HASH" required></div>
+          <div class="col"><button type="submit" class="btn btn-primary">إضافة جلسة</button></div>
+        </div>
+      </form>
+      <table class="table table-bordered">
+        <thead><tr><th>API ID</th><th>API HASH</th><th>Session Name</th></tr></thead>
+        <tbody id="sessions-table"></tbody>
+      </table>
+    </div>
+    
+    <div id="logs-section" style="display:none;">
+      <h3>السجلات</h3>
+      <table class="table table-bordered">
+        <thead><tr><th>الوقت</th><th>القناة</th><th>النص الأصلي</th><th>النص المنظف</th><th>البوت الهدف</th><th>الحالة</th></tr></thead>
+        <tbody id="logs-table"></tbody>
+      </table>
+    </div>
+    
+  </div>
+</div>
+
+<script>
+function showSection(section) {
+  document.getElementById('channels-section').style.display = 'none';
+  document.getElementById('sessions-section').style.display = 'none';
+  document.getElementById('logs-section').style.display = 'none';
+  document.getElementById(section+'-section').style.display = 'block';
+}
+
+// Load data
+async function loadChannels() {
+  const res = await fetch('/api/channels');
+  const data = await res.json();
+  const tbody = document.getElementById('channels-table');
+  tbody.innerHTML = '';
+  data.forEach(c=>{
+    tbody.innerHTML += `<tr>
+      <td>${c.channel_name}</td>
+      <td>${c.bot_target}</td>
+      <td>${c.active ? 'مفعل':'موقف'}</td>
+      <td>
+        <button onclick="toggleChannel('${c.channel_name}','${c.active ? 'stop':'start'}')" class="btn btn-sm btn-warning">${c.active ? 'إيقاف':'تفعيل'}</button>
+        <button onclick="deleteChannel('${c.channel_name}')" class="btn btn-sm btn-danger">حذف</button>
+      </td>
+    </tr>`;
+  });
+}
+
+async function toggleChannel(channel, action) {
+  await fetch('/api/toggle_channel', {
+    method:'POST',
+    body: new URLSearchParams({channel, action})
+  });
+  loadChannels();
+}
+
+async function deleteChannel(channel) {
+  await fetch('/api/delete_channel', {
+    method:'POST',
+    body: new URLSearchParams({channel})
+  });
+  loadChannels();
+}
+
+document.getElementById('add-channel-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const form = new FormData(e.target);
+  await fetch('/api/add_channel', {method:'POST', body: form});
+  e.target.reset();
+  loadChannels();
+});
+
+loadChannels();
+</script>
 </body>
 </html>
