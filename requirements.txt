@@ -1,7 +1,9 @@
 Flask==2.3.6
-python-telegram-bot==20.7
-Pyrogram==2.0.105
+pyrogram==2.0.104
 tgcrypto==1.4.2
+python-telegram-bot==13.21
+sqlite3
+logging
+hashlib
+requests
 Werkzeug==2.3.6
-Jinja2==3.1.2
-requests==2.31.0
