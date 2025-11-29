@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="UTF-8">
+<title>Dashboard</title>
+</head>
+<body>
+<h2>Dashboard</h2>
+<p>Bot Running: {{ bot_running }}</p>
+<table border="1">
+<tr><th>Channel</th><th>Bot Target</th><th>Active</th></tr>
+{% for row in channels %}
+<tr>
+<td>{{ row[1] }}</td>
+<td>{{ row[2] }}</td>
+<td>{{ row[3] }}</td>
+</tr>
+{% endfor %}
+</table>
+</body>
+</html>
