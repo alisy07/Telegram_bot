@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="ar">
+<head><meta charset="utf-8"><title>Logs</title></head>
+<body>
+<h3>Logs</h3>
+<table border="1">
+<thead><tr><th>time</th><th>source</th><th>cleaned</th><th>target</th><th>status</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[4] }}</td><td>{{ r[5] }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</body>
+</html>

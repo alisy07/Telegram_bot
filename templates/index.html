@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ar">
+<head><meta charset="utf-8"><title>Dashboard</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>body{direction:rtl;padding:20px}</style>
+</head>
+<body>
+<div class="container-fluid">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2>لوحة التحكم</h2>
+    <div><a href="/logout" class="btn btn-secondary">تسجيل الخروج</a></div>
+  </div>
+
+  <div class="row">
+    <div class="col-md-6">
+      <h4>إضافة قناة</h4>
+      <form id="add-channel-form">
+        <div class="mb-2"><input class="form-control" name="channel" placeholder="اسم القناة بدون @" required></div>
+        <div class="mb-2"><input class="form-control" name="bot" placeholder="البوت الهدف بدون @" required></div>
+        <div class="form-check mb-2"><input type="checkbox" class="form-check-input" id="activate" name="activate" checked><label class="form-check-label" for="activate">تفعيل فوراً</label></div>
+        <button class="btn btn-primary">إضافة</button>
+      </form>
+      <hr>
+      <h4>الجلسة الحالية</h4>
+      <form id="set-api-form">
+        <div class="mb-2"><input class="form-control" name="api_id" placeholder="API ID" required></div>
+        <div class="mb-2"><input class="form-control" name="api_hash" placeholder="API HASH" required></div>
+        <button class="btn btn-warning">حفظ الجلسة</button>
+      </form>
+    </div>
+
+    <div class="col-md-6">
+      <h4>القنوات</h4>
+      <table class="table table-bordered">
+        <thead><tr><th>القناة</th><th>البوت الهدف</th><th>الحالة</th><th>أداء</th></tr></thead>
+        <tbody id="channels-table"></tbody>
+      </table>
+      <h4>السجلات</h4>
+      <table class="table table-sm table-striped">
+        <thead><tr><th>وقت</th><th>القناة</th><th>المنظف</th><th>الهدف</th><th>الحالة</th></tr></thead>
+        <tbody id="logs-table"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+async function loadChannels(){
+  const res = await fetch('/api/channels');
+  const data = await res.json();
+  const tb = document.getElementById('channels-table'); tb.innerHTML='';
+  data.forEach(c=>{
+    tb.innerHTML += `<tr><td>@${c.channel_name}</td><td>@${c.bot_target}</td><td>${c.active? 'مفعل':'متوقف'}</td><td>
+      <button class="btn btn-sm btn-${c.active? 'danger':'success'}" onclick="toggleChannel('${c.channel_name}','${c.active? 'stop':'start'}')">${c.active? 'إيقاف':'تفعيل'}</button>
+      <button class="btn btn-sm btn-danger" onclick="deleteChannel('${c.channel_name}')">حذف</button>
+    </td></tr>`;
+  });
+}
+
+async function loadLogs(){
+  const res = await fetch('/api/logs');
+  const data = await res.json();
+  const tb = document.getElementById('logs-table'); tb.innerHTML='';
+  data.forEach(r=>{
+    tb.innerHTML += `<tr><td>${r.ts}</td><td>@${r.source}</td><td>${r.cleaned}</td><td>@${r.target}</td><td>${r.status}</td></tr>`;
+  });
+}
+
+document.getElementById('add-channel-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const form = new FormData(e.target);
+  await fetch('/api/add_channel', {method:'POST', body: new URLSearchParams(form)});
+  e.target.reset();
+  loadChannels();
+});
+
+document.getElementById('set-api-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const form = new FormData(e.target);
+  await fetch('/api/set_api', {method:'POST', body: new URLSearchParams(form)});
+  e.target.reset();
+  alert('Saved API credentials (they will be used when a listener session file exists).');
+});
+
+async function toggleChannel(ch, action){ await fetch('/api/toggle_channel',{method:'POST', body: new URLSearchParams({channel:ch, action})}); loadChannels(); }
+async function deleteChannel(ch){ await fetch('/api/delete_channel',{method:'POST', body: new URLSearchParams({channel:ch})}); loadChannels(); }
+
+async function init(){ await loadChannels(); await loadLogs(); }
+init();
+</script>
+</body>
+</html>
