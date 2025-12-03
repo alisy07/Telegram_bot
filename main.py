@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# main.py - PRO version
 import os
 import re
 import json
@@ -58,6 +57,13 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS logs(
  target TEXT,
  status TEXT
 )""")
+# temp storage for phone_code_hash
+cursor.execute("""CREATE TABLE IF NOT EXISTS temp_codes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  phone TEXT,
+  phone_code_hash TEXT,
+  created_at TEXT
+)""")
 conn.commit()
 
 # in-memory
@@ -72,7 +78,7 @@ load_active_channels()
 # ----------------- Flask (read-only dashboard) -----------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# ----------------- Filtering utilities (finalized) -----------------
+# ----------------- Filtering utilities -----------------
 _LINK_RE = re.compile(r"https?://\S+|www\.\S+")
 _HASHTAG_RE = re.compile(r"#\w+")
 _CODE_RE = re.compile(r"\bcode\b", re.IGNORECASE)
@@ -89,16 +95,13 @@ def remove_code_word(text: str) -> str:
     return _CODE_RE.sub(" ", text)
 
 def clean_symbols(text: str) -> str:
-    # replace symbols with space (keep alnum and underscore)
     return _SYMBOLS_RE.sub(" ", text)
 
 def extract_english_parts(text: str) -> str:
-    # returns concatenated sequences that contain latin letters/digits/underscore/hyphen
     parts = re.findall(r"[A-Za-z0-9_\-]+(?:[A-Za-z0-9_\-]*)", text)
     return " ".join(parts).strip()
 
 def smart_remove_numbers(text: str) -> str:
-    # remove digits which are not adjacent to latin letters
     result_chars = []
     L = len(text)
     for i, ch in enumerate(text):
@@ -113,35 +116,34 @@ def smart_remove_numbers(text: str) -> str:
             if keep:
                 result_chars.append(ch)
             else:
-                # drop digit
                 pass
         else:
             result_chars.append(ch)
     return "".join(result_chars)
 
 def ready_processing(text: str) -> str:
+    """
+    Full processing pipeline:
+    - remove links, hashtags, the word 'code'
+    - remove punctuation/symbols
+    - if message contains latin parts -> extract only latin parts
+    - else remove Arabic script
+    - remove standalone numbers (keep numbers attached to latin letters, e.g., A1 or 1A)
+    - normalize spaces
+    """
     if not text:
         return ""
-    # 1. strip
     text = text.strip()
-    # 2. remove links
     text = remove_links(text)
-    # 3. remove hashtags
     text = remove_hashtags(text)
-    # 4. remove word 'code'
     text = remove_code_word(text)
-    # 5. replace symbols (punctuation) with spaces
     text = clean_symbols(text)
-    # 6. decide: if any latin parts remain, take only latin parts
     eng = extract_english_parts(text)
     if eng:
         text = eng
     else:
-        # remove arabic (i.e., leave numbers or others but we will drop isolated numbers later)
         text = _ARABIC_RE.sub(" ", text)
-    # 7. smart remove numbers
     text = smart_remove_numbers(text)
-    # 8. normalize whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -151,9 +153,9 @@ class BotManager:
         self.bot = None
         self.dispatcher = None
         self.running = False
-        self.waiting_api = {}      # user_id -> True
-        self.waiting_channel = {}  # user_id -> state flow
-        self.waiting_session = {}  # user_id -> {"step":..., "phone":...}
+        self.waiting_api = {}
+        self.waiting_channel = {}
+        self.waiting_session = {}
 
     def read_token(self):
         token = os.environ.get(BOT_TOKEN_ENV)
@@ -175,7 +177,6 @@ class BotManager:
             return False
         self.bot = Bot(token=token)
         self.dispatcher = Dispatcher(self.bot, None, use_context=True)
-        # handlers
         self.dispatcher.add_handler(CommandHandler("start", self.cmd_start))
         self.dispatcher.add_handler(CommandHandler("setapi", self.cmd_setapi))
         self.dispatcher.add_handler(CommandHandler("create_session", self.cmd_create_session))
@@ -184,7 +185,6 @@ class BotManager:
         self.dispatcher.add_handler(CommandHandler("cancel", self.cmd_cancel))
         self.dispatcher.add_handler(CallbackQueryHandler(self.on_callback))
         self.dispatcher.add_handler(MessageHandler(Filters.private & Filters.text, self.on_private))
-        # webhook
         if WEBHOOK_URL:
             try:
                 wh = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -196,7 +196,6 @@ class BotManager:
         logger.info("BotManager started")
         return True
 
-    # --- handlers ---
     def cmd_start(self, update, context):
         user = update.effective_user
         if user and user.id == ADMIN_TELEGRAM_ID:
@@ -263,7 +262,6 @@ class BotManager:
             update.message.reply_text("غير مصرح لك.")
             return
 
-        # session flow
         session_state = self.waiting_session.get(uid)
         if session_state:
             step = session_state.get("step")
@@ -279,12 +277,17 @@ class BotManager:
                     return
                 api_id, api_hash = int(row[0]), str(row[1])
                 try:
-                    # send code via Telethon (async)
                     res = self._telethon_send_code(api_id, api_hash, phone)
                     if not res.get("ok"):
                         update.message.reply_text(f"خطأ أثناء إرسال الكود: {res.get('error')}")
                         self.waiting_session.pop(uid, None)
                         return
+                    phone_code_hash = res.get("phone_code_hash")
+                    try:
+                        cursor.execute("INSERT INTO temp_codes(phone, phone_code_hash, created_at) VALUES (?, ?, datetime('now'))", (phone, phone_code_hash))
+                        conn.commit()
+                    except:
+                        pass
                     session_state["step"] = "code"
                     update.message.reply_text("تم إرسال الكود. أرسله هنا.")
                 except Exception as e:
@@ -302,11 +305,13 @@ class BotManager:
                     self.waiting_session.pop(uid, None)
                     return
                 api_id, api_hash = int(row[0]), str(row[1])
+                cursor.execute("SELECT phone_code_hash FROM temp_codes WHERE phone=? ORDER BY id DESC LIMIT 1", (phone,))
+                r2 = cursor.fetchone()
+                phone_code_hash = r2[0] if r2 else None
                 update.message.reply_text("جاري تسجيل الدخول وحفظ الجلسة — لا تغلق الرسائل...")
-                res = self._telethon_sign_in_and_save(api_id, api_hash, phone, code=code)
+                res = self._telethon_sign_in_and_save(api_id, api_hash, phone, code=code, phone_code_hash=phone_code_hash)
                 if res.get("ok"):
                     update.message.reply_text("✅ تم إنشاء الجلسة وحفظها على الخادم (sessions/listener.session).")
-                    # start pyrogram
                     if pyro_listener.start():
                         update.message.reply_text("🔄 تم تشغيل مستمع Pyrogram تلقائياً.")
                 else:
@@ -339,7 +344,6 @@ class BotManager:
                 self.waiting_session.pop(uid, None)
                 return
 
-        # API saving flow
         if self.waiting_api.get(uid):
             parts = text.split()
             if len(parts) < 2:
@@ -352,13 +356,12 @@ class BotManager:
                     "INSERT INTO sessions(api_id, api_hash, session_name, created_at) VALUES (?, ?, ?, datetime('now'))",
                     (int(api_id), api_hash, "listener"))
                 conn.commit()
-                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\nاستخدم /create_session لإنشاء session عبر البوت أو شغل create_session.py محلياً.")
+                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\\nاستخدم /create_session لإنشاء session عبر البوت أو شغل create_session.py محلياً.")
                 self.waiting_api.pop(uid, None)
             except Exception as e:
                 update.message.reply_text(f"خطأ أثناء الحفظ: {e}")
             return
 
-        # add-channel flow
         state = self.waiting_channel.get(uid)
         if state:
             step = state.get("step")
@@ -381,16 +384,15 @@ class BotManager:
                 self.waiting_channel.pop(uid, None)
                 return
 
-        # keyboards
         if text == "📺 القنوات":
             rows = cursor.execute("SELECT channel_name, bot_target, active FROM channels ORDER BY id DESC").fetchall()
             if not rows:
                 update.message.reply_text("لا توجد قنوات مضافة.")
             else:
-                msg = "القنوات المضافة:\n\n"
+                msg = "القنوات المضافة:\\n\\n"
                 for ch, target, active in rows:
                     status = "✅ مفعل" if active else "❌ متوقف"
-                    msg += f"@{ch} → @{target} ({status})\n"
+                    msg += f"@{ch} → @{target} ({status})\\n"
                 update.message.reply_text(msg)
             return
 
@@ -399,9 +401,9 @@ class BotManager:
             if not rows:
                 update.message.reply_text("لا توجد جلسات مسجلة.")
             else:
-                msg = "الجلسات:\n\n"
+                msg = "الجلسات:\\n\\n"
                 for api_id, api_hash, session_name in rows:
-                    msg += f"{session_name}: {api_id} / {api_hash}\n"
+                    msg += f"{session_name}: {api_id} / {api_hash}\\n"
                 update.message.reply_text(msg)
             return
 
@@ -410,9 +412,9 @@ class BotManager:
             if not rows:
                 update.message.reply_text("لا توجد سجلات بعد.")
             else:
-                msg = "آخر السجلات:\n\n"
+                msg = "آخر السجلات:\\n\\n"
                 for ts, source, cleaned, target, status in rows:
-                    msg += f"{ts} | @{source} → @{target} | {status}\n{cleaned}\n\n"
+                    msg += f"{ts} | @{source} → @{target} | {status}\\n{cleaned}\\n\\n"
                 update.message.reply_text(msg)
             return
 
@@ -423,22 +425,17 @@ class BotManager:
 
         update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi أو /create_session).")
 
-    # ---------------- Telethon helpers (sync wrappers around asyncio.run) ----------------
     def _telethon_send_code(self, api_id, api_hash, phone):
         async def _send():
             client = TelegramClient(os.path.join(SESSIONS_DIR, "tmp_send"), api_id, api_hash)
             await client.connect()
             try:
-                await client.send_code_request(phone)
+                sent = await client.send_code_request(phone)
+                phone_code_hash = None
+                if hasattr(sent, 'phone_code_hash'):
+                    phone_code_hash = sent.phone_code_hash
                 await client.disconnect()
-                # remove tmp
-                try:
-                    tmp = os.path.join(SESSIONS_DIR, "tmp_send.session")
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except:
-                    pass
-                return {"ok": True}
+                return {"ok": True, "phone_code_hash": phone_code_hash}
             except Exception as e:
                 try:
                     await client.disconnect()
@@ -447,7 +444,7 @@ class BotManager:
                 return {"ok": False, "error": str(e)}
         return asyncio.run(_send())
 
-    def _telethon_sign_in_and_save(self, api_id, api_hash, phone, code=None, password=None):
+    def _telethon_sign_in_and_save(self, api_id, api_hash, phone, code=None, phone_code_hash=None, password=None):
         async def _signin():
             session_path = os.path.join(SESSIONS_DIR, "listener")
             client = TelegramClient(session_path, api_id, api_hash)
@@ -455,7 +452,7 @@ class BotManager:
             try:
                 if code:
                     try:
-                        await client.sign_in(phone, code)
+                        await client.sign_in(phone=phone, code=code)
                     except telethon_errors.SessionPasswordNeededError:
                         await client.disconnect()
                         return {"ok": False, "password_needed": True}
@@ -471,7 +468,6 @@ class BotManager:
                 else:
                     await client.disconnect()
                     return {"ok": False, "error": "no_code_or_password"}
-                # success -> Telethon created sessions/listener.session (or folder)
                 await client.disconnect()
                 return {"ok": True}
             except Exception as e:
@@ -484,7 +480,7 @@ class BotManager:
 
 bot_manager = BotManager()
 
-# ----------------- Pyrogram Listener (start/stop + forward) -----------------
+# ----------------- Pyrogram Listener -----------------
 class PyroListener:
     def __init__(self, session_name="listener"):
         self.session_basename = session_name
@@ -520,7 +516,6 @@ class PyroListener:
                 logger.warning("API_ID/API_HASH not found in DB. Use /setapi via bot to store them.")
                 return False
             try:
-                # name must be path to session base (pyrogram will append extension)
                 self.client = Client(name=self.session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
             except Exception as e:
                 logger.exception("Failed to create Pyrogram client: %s", e)
@@ -543,7 +538,6 @@ class PyroListener:
                     if not target:
                         return
                     send_to = target if str(target).startswith("@") else "@" + str(target)
-                    # send via bot_manager.bot (Telegram Bot API)
                     try:
                         if bot_manager.bot:
                             bot_manager.bot.send_message(chat_id=send_to, text=cleaned)
@@ -628,7 +622,6 @@ def webhook_route():
 def start_services():
     bot_manager.start()
     load_active_channels()
-    # try auto-start pyrogram if session exists
     try:
         if pyro_listener.session_file_exists():
             pyro_listener.start()
