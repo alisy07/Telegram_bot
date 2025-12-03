@@ -1,10 +1,18 @@
-# main.py
 #!/usr/bin/env python3
-import os, json, sqlite3, logging, threading, time, re
+# main.py - PRO version
+import os
+import re
+import json
+import sqlite3
+import logging
+import threading
+import time
+import asyncio
 from flask import Flask, request, render_template, jsonify
 from telegram import Bot, Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
 from pyrogram import Client, filters as pyro_filters
+from telethon import TelegramClient, errors as telethon_errors
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -24,7 +32,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or cfg.get("webhook_url") or ""
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# ----------------- DB -----------------
+# ----------------- DB init -----------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""CREATE TABLE IF NOT EXISTS channels(
@@ -52,7 +60,7 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS logs(
 )""")
 conn.commit()
 
-# in-memory cache
+# in-memory
 active_channels = {}
 def load_active_channels():
     active_channels.clear()
@@ -61,26 +69,91 @@ def load_active_channels():
         active_channels[ch] = bt
 load_active_channels()
 
-# ----------------- Flask (read-only) -----------------
+# ----------------- Flask (read-only dashboard) -----------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-def clean_text(text):
+# ----------------- Filtering utilities (finalized) -----------------
+_LINK_RE = re.compile(r"https?://\S+|www\.\S+")
+_HASHTAG_RE = re.compile(r"#\w+")
+_CODE_RE = re.compile(r"\bcode\b", re.IGNORECASE)
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]+")
+_SYMBOLS_RE = re.compile(r"[^\w\s]")  # keep underscores and alnum and whitespace
+
+def remove_links(text: str) -> str:
+    return _LINK_RE.sub(" ", text)
+
+def remove_hashtags(text: str) -> str:
+    return _HASHTAG_RE.sub(" ", text)
+
+def remove_code_word(text: str) -> str:
+    return _CODE_RE.sub(" ", text)
+
+def clean_symbols(text: str) -> str:
+    # replace symbols with space (keep alnum and underscore)
+    return _SYMBOLS_RE.sub(" ", text)
+
+def extract_english_parts(text: str) -> str:
+    # returns concatenated sequences that contain latin letters/digits/underscore/hyphen
+    parts = re.findall(r"[A-Za-z0-9_\-]+(?:[A-Za-z0-9_\-]*)", text)
+    return " ".join(parts).strip()
+
+def smart_remove_numbers(text: str) -> str:
+    # remove digits which are not adjacent to latin letters
+    result_chars = []
+    L = len(text)
+    for i, ch in enumerate(text):
+        if ch.isdigit():
+            prev_c = text[i-1] if i > 0 else ""
+            next_c = text[i+1] if i < L-1 else ""
+            keep = False
+            if prev_c and re.match(r"[A-Za-z]", prev_c):
+                keep = True
+            if next_c and re.match(r"[A-Za-z]", next_c):
+                keep = True
+            if keep:
+                result_chars.append(ch)
+            else:
+                # drop digit
+                pass
+        else:
+            result_chars.append(ch)
+    return "".join(result_chars)
+
+def ready_processing(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'(https?://\S+|www\.\S+)', '', text)
-    text = re.sub(r'@\w+', '', text)
-    text = re.sub(r'[^A-Za-z0-9 ]+', '', text)
-    return re.sub(r'\s+', ' ', text).strip()
+    # 1. strip
+    text = text.strip()
+    # 2. remove links
+    text = remove_links(text)
+    # 3. remove hashtags
+    text = remove_hashtags(text)
+    # 4. remove word 'code'
+    text = remove_code_word(text)
+    # 5. replace symbols (punctuation) with spaces
+    text = clean_symbols(text)
+    # 6. decide: if any latin parts remain, take only latin parts
+    eng = extract_english_parts(text)
+    if eng:
+        text = eng
+    else:
+        # remove arabic (i.e., leave numbers or others but we will drop isolated numbers later)
+        text = _ARABIC_RE.sub(" ", text)
+    # 7. smart remove numbers
+    text = smart_remove_numbers(text)
+    # 8. normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-# ----------------- Bot manager -----------------
+# ----------------- Bot Manager -----------------
 class BotManager:
     def __init__(self):
         self.bot = None
         self.dispatcher = None
         self.running = False
-        # states: waiting for input from admin via private chat
         self.waiting_api = {}      # user_id -> True
-        self.waiting_channel = {}  # user_id -> {"step":..., "channel_name":...}
+        self.waiting_channel = {}  # user_id -> state flow
+        self.waiting_session = {}  # user_id -> {"step":..., "phone":...}
 
     def read_token(self):
         token = os.environ.get(BOT_TOKEN_ENV)
@@ -93,14 +166,6 @@ class BotManager:
                 pass
         return token
 
-    def get_webhook_info(self):
-        if not self.bot:
-            return {}
-        try:
-            return self.bot.get_webhook_info().to_dict()
-        except Exception as e:
-            return {"error": str(e)}
-
     def start(self):
         if self.running:
             return True
@@ -108,20 +173,18 @@ class BotManager:
         if not token:
             logger.warning("No BOT token found (env or config.json)")
             return False
-        try:
-            self.bot = Bot(token=token)
-            self.dispatcher = Dispatcher(self.bot, None, use_context=True)
-        except Exception as e:
-            logger.exception("Failed to init Bot: %s", e)
-            return False
-
+        self.bot = Bot(token=token)
+        self.dispatcher = Dispatcher(self.bot, None, use_context=True)
         # handlers
         self.dispatcher.add_handler(CommandHandler("start", self.cmd_start))
         self.dispatcher.add_handler(CommandHandler("setapi", self.cmd_setapi))
+        self.dispatcher.add_handler(CommandHandler("create_session", self.cmd_create_session))
+        self.dispatcher.add_handler(CommandHandler("start_listener", self.cmd_start_listener))
+        self.dispatcher.add_handler(CommandHandler("stop_listener", self.cmd_stop_listener))
+        self.dispatcher.add_handler(CommandHandler("cancel", self.cmd_cancel))
         self.dispatcher.add_handler(CallbackQueryHandler(self.on_callback))
         self.dispatcher.add_handler(MessageHandler(Filters.private & Filters.text, self.on_private))
-
-        # set webhook if provided
+        # webhook
         if WEBHOOK_URL:
             try:
                 wh = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -129,31 +192,61 @@ class BotManager:
                 logger.info("Webhook set to %s", wh)
             except Exception as e:
                 logger.exception("Failed to set webhook: %s", e)
-
         self.running = True
         logger.info("BotManager started")
         return True
 
-    # --- command handlers ---
+    # --- handlers ---
     def cmd_start(self, update, context):
         user = update.effective_user
         if user and user.id == ADMIN_TELEGRAM_ID:
-            keyboard = [["📺 القنوات", "📡 الجلسات"], ["📝 السجلات", "➕ إضافة قناة"]]
-            update.message.reply_text("مرحبا مدير النظام — اختر:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+            keyboard = [["📺 القنوات", "📡 الجلسات"], ["📝 السجلات", "➕ إضافة قناة"], ["🔁 إنشاء جلسة", "▶️ تشغيل المستمع"]]
+            update.message.reply_text("مرحبا — اختر:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
         else:
             update.message.reply_text("غير مصرح لك.")
 
     def cmd_setapi(self, update, context):
         user = update.effective_user
-        if not (user and user.id == ADMIN_TELEGRAM_ID):
+        if not user or user.id != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
             return
         self.waiting_api[user.id] = True
         update.message.reply_text("أرسل API_ID و API_HASH مفصولين بمسافة واحدة (مثال: 123456 abcdef1234).")
 
-    def send_add_channel_button(self, chat_id):
-        kb = [[InlineKeyboardButton("➕ إضافة قناة جديدة", callback_data="add_channel")]]
-        self.bot.send_message(chat_id=chat_id, text="اضغط لإضافة قناة:", reply_markup=InlineKeyboardMarkup(kb))
+    def cmd_create_session(self, update, context):
+        user = update.effective_user
+        if not user or user.id != ADMIN_TELEGRAM_ID:
+            update.message.reply_text("غير مصرح لك.")
+            return
+        self.waiting_session[user.id] = {"step": "phone"}
+        update.message.reply_text("أرسل رقم هاتفك (مثال: +20100xxxxxxx). سيتم إرسال كود للتحقق.")
+
+    def cmd_start_listener(self, update, context):
+        user = update.effective_user
+        if not user or user.id != ADMIN_TELEGRAM_ID:
+            update.message.reply_text("غير مصرح لك.")
+            return
+        if pyro_listener.start():
+            update.message.reply_text("تم تشغيل مستمع Pyrogram ✅")
+        else:
+            update.message.reply_text("فشل تشغيل المستمع — تأكد من وجود listener session وبيانات API (استخدم /setapi و /create_session).")
+
+    def cmd_stop_listener(self, update, context):
+        user = update.effective_user
+        if not user or user.id != ADMIN_TELEGRAM_ID:
+            update.message.reply_text("غير مصرح لك.")
+            return
+        if pyro_listener.stop():
+            update.message.reply_text("تم إيقاف مستمع Pyrogram ✅")
+        else:
+            update.message.reply_text("فشل إيقاف المستمع.")
+
+    def cmd_cancel(self, update, context):
+        uid = update.effective_user.id
+        self.waiting_api.pop(uid, None)
+        self.waiting_channel.pop(uid, None)
+        self.waiting_session.pop(uid, None)
+        update.message.reply_text("تم إلغاء العملية.")
 
     def on_callback(self, update, context):
         query = update.callback_query
@@ -166,11 +259,85 @@ class BotManager:
     def on_private(self, update, context):
         uid = update.effective_user.id
         text = (update.message.text or "").strip()
-        username = (update.effective_user.username or "").strip()
-
         if uid != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
             return
+
+        # session flow
+        session_state = self.waiting_session.get(uid)
+        if session_state:
+            step = session_state.get("step")
+            if step == "phone":
+                phone = text
+                session_state["phone"] = phone
+                update.message.reply_text("جارٍ إرسال كود التحقق... الرجاء الانتظار.")
+                cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
+                    update.message.reply_text("لا توجد بيانات API_ID/API_HASH في قاعدة البيانات. استخدم /setapi أولاً.")
+                    self.waiting_session.pop(uid, None)
+                    return
+                api_id, api_hash = int(row[0]), str(row[1])
+                try:
+                    # send code via Telethon (async)
+                    res = self._telethon_send_code(api_id, api_hash, phone)
+                    if not res.get("ok"):
+                        update.message.reply_text(f"خطأ أثناء إرسال الكود: {res.get('error')}")
+                        self.waiting_session.pop(uid, None)
+                        return
+                    session_state["step"] = "code"
+                    update.message.reply_text("تم إرسال الكود. أرسله هنا.")
+                except Exception as e:
+                    update.message.reply_text(f"خطأ: {e}")
+                    self.waiting_session.pop(uid, None)
+                return
+
+            if step == "code":
+                code = text
+                phone = session_state.get("phone")
+                cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
+                    update.message.reply_text("بيانات API غير متوفرة. استخدم /setapi.")
+                    self.waiting_session.pop(uid, None)
+                    return
+                api_id, api_hash = int(row[0]), str(row[1])
+                update.message.reply_text("جاري تسجيل الدخول وحفظ الجلسة — لا تغلق الرسائل...")
+                res = self._telethon_sign_in_and_save(api_id, api_hash, phone, code=code)
+                if res.get("ok"):
+                    update.message.reply_text("✅ تم إنشاء الجلسة وحفظها على الخادم (sessions/listener.session).")
+                    # start pyrogram
+                    if pyro_listener.start():
+                        update.message.reply_text("🔄 تم تشغيل مستمع Pyrogram تلقائياً.")
+                else:
+                    if res.get("password_needed"):
+                        session_state["step"] = "password"
+                        update.message.reply_text("الحساب لديه 2FA. أرسل كلمة المرور الآن.")
+                        return
+                    update.message.reply_text(f"فشل إنشاء الجلسة: {res.get('error')}")
+                self.waiting_session.pop(uid, None)
+                return
+
+            if step == "password":
+                password = text
+                phone = session_state.get("phone")
+                cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
+                    update.message.reply_text("بيانات API غير متوفرة. استخدم /setapi.")
+                    self.waiting_session.pop(uid, None)
+                    return
+                api_id, api_hash = int(row[0]), str(row[1])
+                update.message.reply_text("جاري محاولة تسجيل الدخول باستخدام كلمة المرور...")
+                res = self._telethon_sign_in_and_save(api_id, api_hash, phone, password=password)
+                if res.get("ok"):
+                    update.message.reply_text("✅ تم إنشاء الجلسة وحفظها على الخادم.")
+                    if pyro_listener.start():
+                        update.message.reply_text("🔄 تم تشغيل مستمع Pyrogram تلقائياً.")
+                else:
+                    update.message.reply_text(f"فشل: {res.get('error')}")
+                self.waiting_session.pop(uid, None)
+                return
 
         # API saving flow
         if self.waiting_api.get(uid):
@@ -181,16 +348,17 @@ class BotManager:
             api_id, api_hash = parts[0], parts[1]
             try:
                 cursor.execute("DELETE FROM sessions")
-                cursor.execute("INSERT INTO sessions(api_id, api_hash, session_name, created_at) VALUES (?, ?, ?, datetime('now'))",
-                               (int(api_id), api_hash, "listener"))
+                cursor.execute(
+                    "INSERT INTO sessions(api_id, api_hash, session_name, created_at) VALUES (?, ?, ?, datetime('now'))",
+                    (int(api_id), api_hash, "listener"))
                 conn.commit()
-                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\nالخطوة التالية: أنشئ الجلسة محلياً باستخدام create_session.py ثم ارفع ملف listener.session إلى مجلد sessions/")
+                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\nاستخدم /create_session لإنشاء session عبر البوت أو شغل create_session.py محلياً.")
                 self.waiting_api.pop(uid, None)
             except Exception as e:
                 update.message.reply_text(f"خطأ أثناء الحفظ: {e}")
             return
 
-        # add-channel flow (multi-step)
+        # add-channel flow
         state = self.waiting_channel.get(uid)
         if state:
             step = state.get("step")
@@ -213,7 +381,7 @@ class BotManager:
                 self.waiting_channel.pop(uid, None)
                 return
 
-        # keyboard commands
+        # keyboards
         if text == "📺 القنوات":
             rows = cursor.execute("SELECT channel_name, bot_target, active FROM channels ORDER BY id DESC").fetchall()
             if not rows:
@@ -253,11 +421,70 @@ class BotManager:
             update.message.reply_text("أرسل اسم القناة (username بدون @)")
             return
 
-        update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi).")
+        update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi أو /create_session).")
+
+    # ---------------- Telethon helpers (sync wrappers around asyncio.run) ----------------
+    def _telethon_send_code(self, api_id, api_hash, phone):
+        async def _send():
+            client = TelegramClient(os.path.join(SESSIONS_DIR, "tmp_send"), api_id, api_hash)
+            await client.connect()
+            try:
+                await client.send_code_request(phone)
+                await client.disconnect()
+                # remove tmp
+                try:
+                    tmp = os.path.join(SESSIONS_DIR, "tmp_send.session")
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except:
+                    pass
+                return {"ok": True}
+            except Exception as e:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                return {"ok": False, "error": str(e)}
+        return asyncio.run(_send())
+
+    def _telethon_sign_in_and_save(self, api_id, api_hash, phone, code=None, password=None):
+        async def _signin():
+            session_path = os.path.join(SESSIONS_DIR, "listener")
+            client = TelegramClient(session_path, api_id, api_hash)
+            await client.connect()
+            try:
+                if code:
+                    try:
+                        await client.sign_in(phone, code)
+                    except telethon_errors.SessionPasswordNeededError:
+                        await client.disconnect()
+                        return {"ok": False, "password_needed": True}
+                    except Exception as e:
+                        await client.disconnect()
+                        return {"ok": False, "error": str(e)}
+                elif password:
+                    try:
+                        await client.sign_in(password=password)
+                    except Exception as e:
+                        await client.disconnect()
+                        return {"ok": False, "error": str(e)}
+                else:
+                    await client.disconnect()
+                    return {"ok": False, "error": "no_code_or_password"}
+                # success -> Telethon created sessions/listener.session (or folder)
+                await client.disconnect()
+                return {"ok": True}
+            except Exception as e:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                return {"ok": False, "error": str(e)}
+        return asyncio.run(_signin())
 
 bot_manager = BotManager()
 
-# ----------------- Pyrogram Listener -----------------
+# ----------------- Pyrogram Listener (start/stop + forward) -----------------
 class PyroListener:
     def __init__(self, session_name="listener"):
         self.session_basename = session_name
@@ -267,7 +494,6 @@ class PyroListener:
         self.lock = threading.Lock()
 
     def session_file_exists(self):
-        # check multiple possible session file patterns
         return (os.path.exists(self.session_path) or
                 os.path.exists(self.session_path + ".session") or
                 os.path.exists(os.path.join(SESSIONS_DIR, self.session_basename)))
@@ -294,6 +520,7 @@ class PyroListener:
                 logger.warning("API_ID/API_HASH not found in DB. Use /setapi via bot to store them.")
                 return False
             try:
+                # name must be path to session base (pyrogram will append extension)
                 self.client = Client(name=self.session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
             except Exception as e:
                 logger.exception("Failed to create Pyrogram client: %s", e)
@@ -309,13 +536,14 @@ class PyroListener:
                     if username not in active_channels:
                         return
                     text = message.text or message.caption or ""
-                    cleaned = clean_text(text)
+                    cleaned = ready_processing(text)
                     if not cleaned:
                         return
                     target = active_channels.get(username)
                     if not target:
                         return
                     send_to = target if str(target).startswith("@") else "@" + str(target)
+                    # send via bot_manager.bot (Telegram Bot API)
                     try:
                         if bot_manager.bot:
                             bot_manager.bot.send_message(chat_id=send_to, text=cleaned)
@@ -398,13 +626,14 @@ def webhook_route():
 
 # ----------------- start services -----------------
 def start_services():
-    # start bot manager
     bot_manager.start()
-    # load channels from DB into memory
     load_active_channels()
-    # start pyrogram if session file exists
-    if pyro_listener.session_file_exists():
-        pyro_listener.start()
+    # try auto-start pyrogram if session exists
+    try:
+        if pyro_listener.session_file_exists():
+            pyro_listener.start()
+    except Exception:
+        logger.exception("auto-start pyro failed")
 
 threading.Thread(target=start_services, daemon=True).start()
 
