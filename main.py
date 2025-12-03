@@ -426,58 +426,70 @@ class BotManager:
         update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi أو /create_session).")
 
     def _telethon_send_code(self, api_id, api_hash, phone):
-        async def _send():
-            client = TelegramClient(os.path.join(SESSIONS_DIR, "tmp_send"), api_id, api_hash)
-            await client.connect()
+    async def _send():
+        # نستخدم session مؤقت لطلب الكود
+        client = TelegramClient(os.path.join(SESSIONS_DIR, "tmp_send"), api_id, api_hash)
+        await client.connect()
+        try:
+            sent = await client.send_code_request(phone)
+            phone_code_hash = None
+            # Telethon قد يُعيد phone_code_hash كـ attribute
+            if hasattr(sent, 'phone_code_hash'):
+                phone_code_hash = sent.phone_code_hash
+            # بعض نسخ Telethon قد تعيد sent.phone_code.hash أو sent.phone_code.hash.value
+            # نتحرّى أيضاً داخل الخصائص المتاحة
+            elif hasattr(sent, 'phone_code') and hasattr(sent.phone_code, 'phone_code_hash'):
+                phone_code_hash = sent.phone_code.phone_code_hash
+            await client.disconnect()
+            return {"ok": True, "phone_code_hash": phone_code_hash}
+        except Exception as e:
             try:
-                sent = await client.send_code_request(phone)
-                phone_code_hash = None
-                if hasattr(sent, 'phone_code_hash'):
-                    phone_code_hash = sent.phone_code_hash
                 await client.disconnect()
-                return {"ok": True, "phone_code_hash": phone_code_hash}
-            except Exception as e:
-                try:
-                    await client.disconnect()
-                except:
-                    pass
-                return {"ok": False, "error": str(e)}
-        return asyncio.run(_send())
+            except:
+                pass
+            return {"ok": False, "error": str(e)}
+    return asyncio.run(_send())
 
     def _telethon_sign_in_and_save(self, api_id, api_hash, phone, code=None, phone_code_hash=None, password=None):
-        async def _signin():
-            session_path = os.path.join(SESSIONS_DIR, "listener")
-            client = TelegramClient(session_path, api_id, api_hash)
-            await client.connect()
-            try:
-                if code:
-                    try:
-                        await client.sign_in(phone=phone, code=code)
-                    except telethon_errors.SessionPasswordNeededError:
-                        await client.disconnect()
-                        return {"ok": False, "password_needed": True}
-                    except Exception as e:
-                        await client.disconnect()
-                        return {"ok": False, "error": str(e)}
-                elif password:
-                    try:
-                        await client.sign_in(password=password)
-                    except Exception as e:
-                        await client.disconnect()
-                        return {"ok": False, "error": str(e)}
-                else:
-                    await client.disconnect()
-                    return {"ok": False, "error": "no_code_or_password"}
-                await client.disconnect()
-                return {"ok": True}
-            except Exception as e:
+    async def _signin():
+        session_path = os.path.join(SESSIONS_DIR, "listener")
+        client = TelegramClient(session_path, api_id, api_hash)
+        await client.connect()
+        try:
+            if code:
                 try:
+                    # إذا توافر phone_code_hash نمرّره (بعض نسخ Telethon تدعمه)
+                    if phone_code_hash:
+                        # Telethon قد يقبل sign_in(phone=..., code=..., phone_code_hash=...)
+                        # نحاول تمرير الـ hash لتجنب الخطأ "need phone_code_hash"
+                        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                    else:
+                        await client.sign_in(phone=phone, code=code)
+                except telethon_errors.SessionPasswordNeededError:
                     await client.disconnect()
-                except:
-                    pass
-                return {"ok": False, "error": str(e)}
-        return asyncio.run(_signin())
-
+                    return {"ok": False, "password_needed": True}
+                except Exception as e:
+                    # في حالة فشل sign_in حاول إظهار الخطأ الكامل
+                    await client.disconnect()
+                    return {"ok": False, "error": str(e)}
+            elif password:
+                try:
+                    await client.sign_in(password=password)
+                except Exception as e:
+                    await client.disconnect()
+                    return {"ok": False, "error": str(e)}
+            else:
+                await client.disconnect()
+                return {"ok": False, "error": "no_code_or_password"}
+            await client.disconnect()
+            return {"ok": True}
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            return {"ok": False, "error": str(e)}
+    return asyncio.run(_signin())
 bot_manager = BotManager()
 
 # ----------------- Pyrogram Listener -----------------
