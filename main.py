@@ -298,6 +298,7 @@ class BotManager:
             if step == "code":
                 code = text
                 phone = session_state.get("phone")
+                # تأكد أن لدينا API creds
                 cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
                 row = cursor.fetchone()
                 if not row:
@@ -305,24 +306,29 @@ class BotManager:
                     self.waiting_session.pop(uid, None)
                     return
                 api_id, api_hash = int(row[0]), str(row[1])
+            
+                # جلب آخر phone_code_hash المرتبط بالهاتف من temp_codes
                 cursor.execute("SELECT phone_code_hash FROM temp_codes WHERE phone=? ORDER BY id DESC LIMIT 1", (phone,))
                 r2 = cursor.fetchone()
                 phone_code_hash = r2[0] if r2 else None
+            
                 update.message.reply_text("جاري تسجيل الدخول وحفظ الجلسة — لا تغلق الرسائل...")
                 res = self._telethon_sign_in_and_save(api_id, api_hash, phone, code=code, phone_code_hash=phone_code_hash)
                 if res.get("ok"):
                     update.message.reply_text("✅ تم إنشاء الجلسة وحفظها على الخادم (sessions/listener.session).")
+                    # تشغيل المستمع تلقائياً إن أمكن
                     if pyro_listener.start():
                         update.message.reply_text("🔄 تم تشغيل مستمع Pyrogram تلقائياً.")
                 else:
                     if res.get("password_needed"):
                         session_state["step"] = "password"
-                        update.message.reply_text("الحساب لديه 2FA. أرسل كلمة المرور الآن.")
+                        update.message.reply_text("الحساب يطلب كلمة مرور 2FA. أرسل كلمة المرور الآن.")
                         return
+                    # إظهار رسالة الخطأ المفصّلة
                     update.message.reply_text(f"فشل إنشاء الجلسة: {res.get('error')}")
                 self.waiting_session.pop(uid, None)
                 return
-
+                
             if step == "password":
                 password = text
                 phone = session_state.get("phone")
