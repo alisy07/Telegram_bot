@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# create_session.py - run locally to create session file using API from DB or manual entry
 import sqlite3, os
 from pyrogram import Client
 
@@ -24,7 +23,7 @@ def read_api_from_db():
 def main():
     api_id, api_hash = read_api_from_db()
     if not api_id or not api_hash:
-        api_id = int(input("Enter API_ID: ").strip())
+        api_id = int(input("API_ID not found. Enter API_ID: ").strip())
         api_hash = input("Enter API_HASH: ").strip()
     session_name = input("Session name (listener): ").strip() or "listener"
     print("Starting Pyrogram to create session locally...")
