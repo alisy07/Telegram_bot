@@ -1,6 +1,7 @@
 {
-  "admin_telegram_id": 1037850299,
-  "bot_token_env_name": "BOT_TOKEN",
-  "listen_port": 10000,
-  "webhook_url": ""
+    "admin_telegram_id": 1037850299,
+    "bot_token_env_name": "BOT_TOKEN",
+    "db_url_env_name": "DATABASE_URL",
+    "listen_port": 10000,
+    "webhook_url": ""
 }
