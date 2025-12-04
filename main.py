@@ -567,24 +567,17 @@ class PyroListener:
                 try:
                     # ensure loop exists in this run thread as well
                     ensure_event_loop()
-                    # start() may block — running inside a dedicated thread is fine
-                    self.client.start()
-                    self.running = True
-                    logger.info("Pyrogram client started")
-                    while self.running:
-                        time.sleep(1)
+                    # استخدم run() بدل start() + loop يدوي
+                    self.client.run()  # هذا يقوم بتشغيل client وتنفيذ handlers مباشرة
+                    # بعد run() لا داعي لل while-loop
                 except Exception:
                     logger.exception("Pyrogram run error")
                 finally:
-                    try:
-                        self.client.stop()
-                    except:
-                        pass
                     self.running = False
-
-            t = threading.Thread(target=_run, daemon=True)
-            t.start()
-            return True
+            
+                        t = threading.Thread(target=_run, daemon=True)
+                        t.start()
+                        return True
 
     def stop(self):
         with self.lock:
