@@ -575,9 +575,10 @@ class PyroListener:
                 finally:
                     self.running = False
             
-                        t = threading.Thread(target=_run, daemon=True)
-                        t.start()
-                        return True
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            return True
 
     def stop(self):
         with self.lock:
