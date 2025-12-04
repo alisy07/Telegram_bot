@@ -31,6 +31,15 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or cfg.get("webhook_url") or ""
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
+# ----------------- helper: ensure asyncio loop in current thread -----------------
+def ensure_event_loop():
+    """Ensure current thread has an asyncio event loop set."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
 # ----------------- DB init -----------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
@@ -515,7 +524,10 @@ class PyroListener:
                 logger.warning("API_ID/API_HASH not found in DB. Use /setapi via bot to store them.")
                 return False
             try:
-                self.client = Client(name=self.session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
+                # ensure current thread has an asyncio loop (fixes: There is no current event loop in thread ...)
+                ensure_event_loop()
+                # create client using session filename (pyrogram accepts session_name as first arg)
+                self.client = Client(self.session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
             except Exception as e:
                 logger.exception("Failed to create Pyrogram client: %s", e)
                 return False
@@ -553,6 +565,9 @@ class PyroListener:
 
             def _run():
                 try:
+                    # ensure loop exists in this run thread as well
+                    ensure_event_loop()
+                    # start() may block — running inside a dedicated thread is fine
                     self.client.start()
                     self.running = True
                     logger.info("Pyrogram client started")
@@ -619,6 +634,9 @@ def webhook_route():
 
 # ----------------- start services -----------------
 def start_services():
+    # this runs in a separate thread — ensure it has an asyncio event loop
+    ensure_event_loop()
+
     bot_manager.start()
     load_active_channels()
     try:
