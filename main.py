@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Improved main.py
+- fixes asyncio event loop in threads for Pyrogram
+- improved /setapi, upload session handling and start_listener flow
+- logs and DB usage preserved
+"""
+
 import os
 import re
 import json
@@ -8,7 +16,7 @@ import threading
 import time
 import asyncio
 from flask import Flask, request, render_template, jsonify
-from telegram import Bot, Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, Update, ReplyKeyboardMarkup
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
 from pyrogram import Client, filters as pyro_filters
 from telethon import TelegramClient, errors as telethon_errors
@@ -19,7 +27,7 @@ DB_FILE = os.path.join(BASE_DIR, "bot.db")
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# load config
+# load config (minimal validation)
 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
@@ -66,14 +74,12 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS logs(
  target TEXT,
  status TEXT
 )""")
-# temp storage for phone_code_hash (kept for compatibility but not required when uploading session)
 cursor.execute("""CREATE TABLE IF NOT EXISTS temp_codes(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   phone TEXT,
   phone_code_hash TEXT,
   created_at TEXT
 )""")
-# new table: store session files as BLOB (optional backup)
 cursor.execute("""CREATE TABLE IF NOT EXISTS session_files(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE,
@@ -138,15 +144,6 @@ def smart_remove_numbers(text: str) -> str:
     return "".join(result_chars)
 
 def ready_processing(text: str) -> str:
-    """
-    Full processing pipeline:
-    - remove links, hashtags, the word 'code'
-    - remove punctuation/symbols
-    - if message contains latin parts -> extract only latin parts
-    - else remove Arabic script
-    - remove standalone numbers (keep numbers attached to latin letters, e.g., A1 or 1A)
-    - normalize spaces
-    """
     if not text:
         return ""
     text = text.strip()
@@ -233,26 +230,42 @@ class BotManager:
         if not user or user.id != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
             return
+        # instruct admin to send "API_ID API_HASH"
         self.waiting_api[user.id] = True
         update.message.reply_text("أرسل API_ID و API_HASH مفصولين بمسافة واحدة (مثال: 123456 abcdef1234).")
 
     def cmd_create_session(self, update, context):
-        # keep for compatibility but advise admin to upload session file instead
         user = update.effective_user
         if not user or user.id != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
             return
-        update.message.reply_text("يمكنك الآن رفع ملف الجلسة مباشرة عبر إرسال ملف .session إلى البوت في محادثة خاصة (بدلاً من خطوات الهاتف/الكود).")
+        update.message.reply_text("أرسل ملف الجلسة (listener.session) هنا في المحادثة الخاصة مع البوت.")
 
     def cmd_start_listener(self, update, context):
         user = update.effective_user
         if not user or user.id != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
             return
-        if pyro_listener.start():
+
+        # validations with clear messages
+        if not pyro_listener.session_file_exists():
+            update.message.reply_text("⚠️ لا يوجد ملف listener.session في مجلد sessions/. أرسل الملف أولاً عبر رفعه هنا.")
+            return
+
+        api_id, api_hash = pyro_listener.read_api_creds()
+        if not api_id or not api_hash:
+            update.message.reply_text("⚠️ لم يتم إدخال API_ID/API_HASH. استخدم /setapi لإدخالهم قبل تشغيل المستمع.")
+            return
+
+        if pyro_listener.running:
+            update.message.reply_text("المستمع يعمل بالفعل ✅")
+            return
+
+        ok = pyro_listener.start()
+        if ok:
             update.message.reply_text("تم تشغيل مستمع Pyrogram ✅")
         else:
-            update.message.reply_text("فشل تشغيل المستمع — تأكد من وجود listener.session وبيانات API (استخدم /setapi).")
+            update.message.reply_text("فشل تشغيل المستمع ❌ — راجع سجلات الخادم.")
 
     def cmd_stop_listener(self, update, context):
         user = update.effective_user
@@ -286,7 +299,7 @@ class BotManager:
             update.message.reply_text("غير مصرح لك.")
             return
 
-        # keep older session flow but suggest upload
+        # handle setapi flow
         if self.waiting_api.get(uid):
             parts = text.split()
             if len(parts) < 2:
@@ -299,9 +312,10 @@ class BotManager:
                     "INSERT INTO sessions(api_id, api_hash, session_name, created_at) VALUES (?, ?, ?, datetime('now'))",
                     (int(api_id), api_hash, "listener"))
                 conn.commit()
-                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\nيمكنك الآن رفع ملف listener.session إلى البوت (أرسل الملف هنا).")
+                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\nإذا كان لديك ملف listener.session ارفعه الآن (أرسل الملف هنا).")
                 self.waiting_api.pop(uid, None)
             except Exception as e:
+                logger.exception("Failed to save API creds")
                 update.message.reply_text(f"خطأ أثناء الحفظ: {e}")
             return
 
@@ -324,6 +338,7 @@ class BotManager:
                     active_channels[ch] = target
                     update.message.reply_text(f"تم إضافة @{ch} → @{target} ✅")
                 except Exception as e:
+                    logger.exception("Failed to add channel")
                     update.message.reply_text(f"خطأ أثناء الإضافة: {e}")
                 self.waiting_channel.pop(uid, None)
                 return
@@ -370,9 +385,9 @@ class BotManager:
 
         update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi أو أرسل ملف listener.session).")
 
-    # ----------------- NEW: handle uploaded session file -----------------
+    # ----------------- handle uploaded session file -----------------
     def on_document(self, update, context):
-        """Handle document upload (only admin). Save to sessions/ and DB, then start listener."""
+        """Handle document upload (only admin). Save to sessions/ and DB, then start listener if possible."""
         user = update.effective_user
         if not user or user.id != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
@@ -385,18 +400,14 @@ class BotManager:
 
         filename = doc.file_name or "listener.session"
         # prefer listener.session name
-        if not filename.endswith(".session"):
-            # allow but warn
-            suggested = "listener.session"
-        else:
-            suggested = filename
+        suggested = "listener.session" if not filename.endswith(".session") else filename
 
         try:
             # download file to sessions/
             file_obj = self.bot.get_file(doc.file_id)
             save_path = os.path.join(SESSIONS_DIR, suggested)
-            # file.download(custom_path=save_path)  # python-telegram-bot v13
             file_obj.download(custom_path=save_path)
+            logger.info("Saved uploaded session to %s", save_path)
         except Exception as e:
             logger.exception("Failed to download session file")
             update.message.reply_text(f"فشل تنزيل الملف: {e}")
@@ -409,36 +420,35 @@ class BotManager:
             cursor.execute("INSERT OR REPLACE INTO session_files(name, data, created_at) VALUES (?,?,datetime('now'))",
                            (suggested, sqlite3.Binary(data)))
             conn.commit()
-        except Exception as e:
-            logger.exception("Failed to save session file into DB")
-            update.message.reply_text(f"تم حفظ الملف على الخادم لكن فشل حفظ نسخة في DB: {e}")
-            # continue anyway
+        except Exception:
+            logger.exception("Failed to save session file into DB (non-fatal)")
 
         update.message.reply_text(f"تم استقبال وحفظ الملف كـ {suggested}. سأحاول تشغيل المستمع تلقائياً...")
 
-        # try to start pyro listener
-        try:
-            ok = pyro_listener.start()
-            if ok:
-                update.message.reply_text("تم تشغيل مستمع Pyrogram باستخدام الجلسة المرفوعة ✅")
-            else:
-                update.message.reply_text("تم حفظ الجلسة لكن Pyrogram لم يبدأ تلقائياً — تأكد من API_ID/API_HASH محفوظين (استخدم /setapi).")
-        except Exception as e:
-            logger.exception("Error starting pyro after upload")
-            update.message.reply_text(f"الملف حفظ لكن حدث خطأ عند تشغيل المستمع: {e}")
+        # try to start pyro listener if API creds present
+        api_id, api_hash = pyro_listener.read_api_creds()
+        if not api_id or not api_hash:
+            update.message.reply_text("ملف الجلسة محفوظ، لكن لم يتم إدخال API_ID/API_HASH بعد. استخدم /setapi لإدخالها.")
+            return
+
+        # start listener
+        if pyro_listener.running:
+            update.message.reply_text("المستمع يعمل بالفعل ✅")
+            return
+
+        ok = pyro_listener.start()
+        if ok:
+            update.message.reply_text("تم تشغيل مستمع Pyrogram باستخدام الجلسة المرفوعة ✅")
+        else:
+            update.message.reply_text("تم حفظ الجلسة لكن فشل تشغيل Pyrogram تلقائياً. راجع سجلات الخادم.")
 
     def _telethon_send_code(self, api_id, api_hash, phone):
         async def _send():
-            # kept for compatibility but may not be used when uploading session
             client = TelegramClient(os.path.join(SESSIONS_DIR, "tmp_send"), api_id, api_hash)
             await client.connect()
             try:
                 sent = await client.send_code_request(phone)
-                phone_code_hash = None
-                if hasattr(sent, 'phone_code_hash'):
-                    phone_code_hash = sent.phone_code_hash
-                elif hasattr(sent, 'phone_code') and hasattr(sent.phone_code, 'phone_code_hash'):
-                    phone_code_hash = sent.phone_code.phone_code_hash
+                phone_code_hash = getattr(sent, "phone_code_hash", None)
                 await client.disconnect()
                 return {"ok": True, "phone_code_hash": phone_code_hash}
             except Exception as e:
@@ -491,22 +501,22 @@ bot_manager = BotManager()
 # ----------------- Pyrogram Listener -----------------
 class PyroListener:
     def __init__(self, session_name="listener"):
-        self.session_basename = session_name
-        self.session_path = os.path.join(SESSIONS_DIR, self.session_basename)
+        self.session_basename = session_name  # 'listener'
         self.client = None
         self.running = False
         self.lock = threading.Lock()
 
     def session_file_exists(self):
-        return (os.path.exists(self.session_path) or
-                os.path.exists(self.session_path + ".session") or
-                os.path.exists(os.path.join(SESSIONS_DIR, self.session_basename)))
+        # pyrogram accepts session name (it will look in workdir)
+        p1 = os.path.join(SESSIONS_DIR, self.session_basename)
+        p2 = p1 + ".session"
+        return os.path.exists(p1) or os.path.exists(p2)
 
     def read_api_creds(self):
         try:
             cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
             row = cursor.fetchone()
-            if row:
+            if row and row[0] and row[1]:
                 return int(row[0]), str(row[1])
         except Exception as e:
             logger.debug("read_api_creds error: %s", e)
@@ -515,23 +525,28 @@ class PyroListener:
     def start(self):
         with self.lock:
             if self.running:
+                logger.info("PyroListener.start called but already running")
                 return True
+
             if not self.session_file_exists():
                 logger.warning("لا توجد جلسة Pyrogram في sessions/ — ضع listener.session هنا")
                 return False
+
             api_id, api_hash = self.read_api_creds()
             if not api_id or not api_hash:
                 logger.warning("API_ID/API_HASH not found in DB. Use /setapi via bot to store them.")
                 return False
+
+            # create client using session basename and explicit workdir
             try:
-                # ensure current thread has an asyncio loop (fixes: There is no current event loop in thread ...)
                 ensure_event_loop()
-                # create client using session filename (pyrogram accepts session_name as first arg)
-                self.client = Client(self.session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
+                # session_name passed as basename; use workdir to point to sessions/
+                self.client = Client(self.session_basename, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
             except Exception as e:
                 logger.exception("Failed to create Pyrogram client: %s", e)
                 return False
 
+            # register handler BEFORE running
             @self.client.on_message(pyro_filters.channel)
             def on_channel_message(client, message):
                 try:
@@ -563,31 +578,42 @@ class PyroListener:
                 except Exception:
                     logger.exception("on_channel_message error")
 
+            # run the client in a dedicated thread using run()
             def _run():
                 try:
-                    # ensure loop exists in this run thread as well
                     ensure_event_loop()
-                    # استخدم run() بدل start() + loop يدوي
-                    self.client.run()  # هذا يقوم بتشغيل client وتنفيذ handlers مباشرة
-                    # بعد run() لا داعي لل while-loop
+                    logger.info("Starting Pyrogram client.run() (this will block until stop)")
+                    self.running = True
+                    # run() will start the client and block the thread until stop() or disconnect
+                    self.client.run()
+                    logger.info("Pyrogram client.run() exited")
                 except Exception:
                     logger.exception("Pyrogram run error")
                 finally:
                     self.running = False
-            
 
             t = threading.Thread(target=_run, daemon=True)
             t.start()
+            # small wait to verify start (non-blocking)
+            for _ in range(10):
+                if self.running:
+                    break
+                time.sleep(0.2)
+            if not self.running:
+                logger.warning("Pyrogram thread started but client not running yet")
             return True
 
     def stop(self):
         with self.lock:
-            if not self.running:
+            if not self.running and not self.client:
                 return True
             try:
                 self.running = False
                 if self.client:
-                    self.client.stop()
+                    try:
+                        self.client.stop()  # this will stop the run loop
+                    except Exception:
+                        logger.exception("Error stopping pyrogram client")
                 logger.info("Pyrogram stopped")
                 return True
             except Exception:
@@ -635,10 +661,16 @@ def start_services():
     load_active_channels()
     try:
         if pyro_listener.session_file_exists():
-            pyro_listener.start()
+            # only attempt start if both session file AND API creds present
+            api_id, api_hash = pyro_listener.read_api_creds()
+            if api_id and api_hash:
+                pyro_listener.start()
+            else:
+                logger.info("Session file found but API creds missing; waiting for /setapi")
     except Exception:
         logger.exception("auto-start pyro failed")
 
+# start background thread to init bot + optional pyro listener
 threading.Thread(target=start_services, daemon=True).start()
 
 if __name__ == "__main__":
