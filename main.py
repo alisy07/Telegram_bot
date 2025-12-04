@@ -57,11 +57,18 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS logs(
  target TEXT,
  status TEXT
 )""")
-# temp storage for phone_code_hash
+# temp storage for phone_code_hash (kept for compatibility but not required when uploading session)
 cursor.execute("""CREATE TABLE IF NOT EXISTS temp_codes(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   phone TEXT,
   phone_code_hash TEXT,
+  created_at TEXT
+)""")
+# new table: store session files as BLOB (optional backup)
+cursor.execute("""CREATE TABLE IF NOT EXISTS session_files(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT UNIQUE,
+  data BLOB,
   created_at TEXT
 )""")
 conn.commit()
@@ -177,14 +184,22 @@ class BotManager:
             return False
         self.bot = Bot(token=token)
         self.dispatcher = Dispatcher(self.bot, None, use_context=True)
+
+        # command handlers
         self.dispatcher.add_handler(CommandHandler("start", self.cmd_start))
         self.dispatcher.add_handler(CommandHandler("setapi", self.cmd_setapi))
         self.dispatcher.add_handler(CommandHandler("create_session", self.cmd_create_session))
         self.dispatcher.add_handler(CommandHandler("start_listener", self.cmd_start_listener))
         self.dispatcher.add_handler(CommandHandler("stop_listener", self.cmd_stop_listener))
         self.dispatcher.add_handler(CommandHandler("cancel", self.cmd_cancel))
+
+        # callback and message handlers
         self.dispatcher.add_handler(CallbackQueryHandler(self.on_callback))
         self.dispatcher.add_handler(MessageHandler(Filters.private & Filters.text, self.on_private))
+
+        # NEW: handle document uploads in private chat
+        self.dispatcher.add_handler(MessageHandler(Filters.document & Filters.private, self.on_document))
+
         if WEBHOOK_URL:
             try:
                 wh = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -199,7 +214,7 @@ class BotManager:
     def cmd_start(self, update, context):
         user = update.effective_user
         if user and user.id == ADMIN_TELEGRAM_ID:
-            keyboard = [["📺 القنوات", "📡 الجلسات"], ["📝 السجلات", "➕ إضافة قناة"], ["🔁 إنشاء جلسة", "▶️ تشغيل المستمع"]]
+            keyboard = [["📺 القنوات", "📡 الجلسات"], ["📝 السجلات", "➕ إضافة قناة"], ["🔁 إنشاء جلسة (رفع)", "▶️ تشغيل المستمع"]]
             update.message.reply_text("مرحبا — اختر:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
         else:
             update.message.reply_text("غير مصرح لك.")
@@ -213,12 +228,12 @@ class BotManager:
         update.message.reply_text("أرسل API_ID و API_HASH مفصولين بمسافة واحدة (مثال: 123456 abcdef1234).")
 
     def cmd_create_session(self, update, context):
+        # keep for compatibility but advise admin to upload session file instead
         user = update.effective_user
         if not user or user.id != ADMIN_TELEGRAM_ID:
             update.message.reply_text("غير مصرح لك.")
             return
-        self.waiting_session[user.id] = {"step": "phone"}
-        update.message.reply_text("أرسل رقم هاتفك (مثال: +20100xxxxxxx). سيتم إرسال كود للتحقق.")
+        update.message.reply_text("يمكنك الآن رفع ملف الجلسة مباشرة عبر إرسال ملف .session إلى البوت في محادثة خاصة (بدلاً من خطوات الهاتف/الكود).")
 
     def cmd_start_listener(self, update, context):
         user = update.effective_user
@@ -228,7 +243,7 @@ class BotManager:
         if pyro_listener.start():
             update.message.reply_text("تم تشغيل مستمع Pyrogram ✅")
         else:
-            update.message.reply_text("فشل تشغيل المستمع — تأكد من وجود listener session وبيانات API (استخدم /setapi و /create_session).")
+            update.message.reply_text("فشل تشغيل المستمع — تأكد من وجود listener.session وبيانات API (استخدم /setapi).")
 
     def cmd_stop_listener(self, update, context):
         user = update.effective_user
@@ -262,94 +277,7 @@ class BotManager:
             update.message.reply_text("غير مصرح لك.")
             return
 
-        session_state = self.waiting_session.get(uid)
-        if session_state:
-            step = session_state.get("step")
-            if step == "phone":
-                phone = text
-                session_state["phone"] = phone
-                update.message.reply_text("جارٍ إرسال كود التحقق... الرجاء الانتظار.")
-                cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    update.message.reply_text("لا توجد بيانات API_ID/API_HASH في قاعدة البيانات. استخدم /setapi أولاً.")
-                    self.waiting_session.pop(uid, None)
-                    return
-                api_id, api_hash = int(row[0]), str(row[1])
-                try:
-                    res = self._telethon_send_code(api_id, api_hash, phone)
-                    if not res.get("ok"):
-                        update.message.reply_text(f"خطأ أثناء إرسال الكود: {res.get('error')}")
-                        self.waiting_session.pop(uid, None)
-                        return
-                    phone_code_hash = res.get("phone_code_hash")
-                    try:
-                        cursor.execute("INSERT INTO temp_codes(phone, phone_code_hash, created_at) VALUES (?, ?, datetime('now'))", (phone, phone_code_hash))
-                        conn.commit()
-                    except:
-                        pass
-                    session_state["step"] = "code"
-                    update.message.reply_text("تم إرسال الكود. أرسله هنا.")
-                except Exception as e:
-                    update.message.reply_text(f"خطأ: {e}")
-                    self.waiting_session.pop(uid, None)
-                return
-
-            if step == "code":
-                code = text
-                phone = session_state.get("phone")
-                # تأكد أن لدينا API creds
-                cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    update.message.reply_text("بيانات API غير متوفرة. استخدم /setapi.")
-                    self.waiting_session.pop(uid, None)
-                    return
-                api_id, api_hash = int(row[0]), str(row[1])
-            
-                # جلب آخر phone_code_hash المرتبط بالهاتف من temp_codes
-                cursor.execute("SELECT phone_code_hash FROM temp_codes WHERE phone=? ORDER BY id DESC LIMIT 1", (phone,))
-                r2 = cursor.fetchone()
-                phone_code_hash = r2[0] if r2 else None
-            
-                update.message.reply_text("جاري تسجيل الدخول وحفظ الجلسة — لا تغلق الرسائل...")
-                res = self._telethon_sign_in_and_save(api_id, api_hash, phone, code=code, phone_code_hash=phone_code_hash)
-                if res.get("ok"):
-                    update.message.reply_text("✅ تم إنشاء الجلسة وحفظها على الخادم (sessions/listener.session).")
-                    # تشغيل المستمع تلقائياً إن أمكن
-                    if pyro_listener.start():
-                        update.message.reply_text("🔄 تم تشغيل مستمع Pyrogram تلقائياً.")
-                else:
-                    if res.get("password_needed"):
-                        session_state["step"] = "password"
-                        update.message.reply_text("الحساب يطلب كلمة مرور 2FA. أرسل كلمة المرور الآن.")
-                        return
-                    # إظهار رسالة الخطأ المفصّلة
-                    update.message.reply_text(f"فشل إنشاء الجلسة: {res.get('error')}")
-                self.waiting_session.pop(uid, None)
-                return
-                
-            if step == "password":
-                password = text
-                phone = session_state.get("phone")
-                cursor.execute("SELECT api_id, api_hash FROM sessions ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if not row:
-                    update.message.reply_text("بيانات API غير متوفرة. استخدم /setapi.")
-                    self.waiting_session.pop(uid, None)
-                    return
-                api_id, api_hash = int(row[0]), str(row[1])
-                update.message.reply_text("جاري محاولة تسجيل الدخول باستخدام كلمة المرور...")
-                res = self._telethon_sign_in_and_save(api_id, api_hash, phone, password=password)
-                if res.get("ok"):
-                    update.message.reply_text("✅ تم إنشاء الجلسة وحفظها على الخادم.")
-                    if pyro_listener.start():
-                        update.message.reply_text("🔄 تم تشغيل مستمع Pyrogram تلقائياً.")
-                else:
-                    update.message.reply_text(f"فشل: {res.get('error')}")
-                self.waiting_session.pop(uid, None)
-                return
-
+        # keep older session flow but suggest upload
         if self.waiting_api.get(uid):
             parts = text.split()
             if len(parts) < 2:
@@ -362,12 +290,13 @@ class BotManager:
                     "INSERT INTO sessions(api_id, api_hash, session_name, created_at) VALUES (?, ?, ?, datetime('now'))",
                     (int(api_id), api_hash, "listener"))
                 conn.commit()
-                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\\nاستخدم /create_session لإنشاء session عبر البوت أو شغل create_session.py محلياً.")
+                update.message.reply_text("تم حفظ API_ID و API_HASH في قاعدة البيانات ✅\nيمكنك الآن رفع ملف listener.session إلى البوت (أرسل الملف هنا).")
                 self.waiting_api.pop(uid, None)
             except Exception as e:
                 update.message.reply_text(f"خطأ أثناء الحفظ: {e}")
             return
 
+        # channel add flow
         state = self.waiting_channel.get(uid)
         if state:
             step = state.get("step")
@@ -390,15 +319,16 @@ class BotManager:
                 self.waiting_channel.pop(uid, None)
                 return
 
+        # keyboard commands (display)
         if text == "📺 القنوات":
             rows = cursor.execute("SELECT channel_name, bot_target, active FROM channels ORDER BY id DESC").fetchall()
             if not rows:
                 update.message.reply_text("لا توجد قنوات مضافة.")
             else:
-                msg = "القنوات المضافة:\\n\\n"
+                msg = "القنوات المضافة:\n\n"
                 for ch, target, active in rows:
                     status = "✅ مفعل" if active else "❌ متوقف"
-                    msg += f"@{ch} → @{target} ({status})\\n"
+                    msg += f"@{ch} → @{target} ({status})\n"
                 update.message.reply_text(msg)
             return
 
@@ -407,9 +337,9 @@ class BotManager:
             if not rows:
                 update.message.reply_text("لا توجد جلسات مسجلة.")
             else:
-                msg = "الجلسات:\\n\\n"
+                msg = "الجلسات:\n\n"
                 for api_id, api_hash, session_name in rows:
-                    msg += f"{session_name}: {api_id} / {api_hash}\\n"
+                    msg += f"{session_name}: {api_id} / {api_hash}\n"
                 update.message.reply_text(msg)
             return
 
@@ -418,9 +348,9 @@ class BotManager:
             if not rows:
                 update.message.reply_text("لا توجد سجلات بعد.")
             else:
-                msg = "آخر السجلات:\\n\\n"
+                msg = "آخر السجلات:\n\n"
                 for ts, source, cleaned, target, status in rows:
-                    msg += f"{ts} | @{source} → @{target} | {status}\\n{cleaned}\\n\\n"
+                    msg += f"{ts} | @{source} → @{target} | {status}\n{cleaned}\n\n"
                 update.message.reply_text(msg)
             return
 
@@ -429,21 +359,75 @@ class BotManager:
             update.message.reply_text("أرسل اسم القناة (username بدون @)")
             return
 
-        update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi أو /create_session).")
+        update.message.reply_text("استخدم الأزرار أو الأوامر المتاحة (مثل /setapi أو أرسل ملف listener.session).")
+
+    # ----------------- NEW: handle uploaded session file -----------------
+    def on_document(self, update, context):
+        """Handle document upload (only admin). Save to sessions/ and DB, then start listener."""
+        user = update.effective_user
+        if not user or user.id != ADMIN_TELEGRAM_ID:
+            update.message.reply_text("غير مصرح لك.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            update.message.reply_text("لم يتم إرفاق ملف.")
+            return
+
+        filename = doc.file_name or "listener.session"
+        # prefer listener.session name
+        if not filename.endswith(".session"):
+            # allow but warn
+            suggested = "listener.session"
+        else:
+            suggested = filename
+
+        try:
+            # download file to sessions/
+            file_obj = self.bot.get_file(doc.file_id)
+            save_path = os.path.join(SESSIONS_DIR, suggested)
+            # file.download(custom_path=save_path)  # python-telegram-bot v13
+            file_obj.download(custom_path=save_path)
+        except Exception as e:
+            logger.exception("Failed to download session file")
+            update.message.reply_text(f"فشل تنزيل الملف: {e}")
+            return
+
+        # read bytes and save into DB as BLOB (backup)
+        try:
+            with open(save_path, "rb") as f:
+                data = f.read()
+            cursor.execute("INSERT OR REPLACE INTO session_files(name, data, created_at) VALUES (?,?,datetime('now'))",
+                           (suggested, sqlite3.Binary(data)))
+            conn.commit()
+        except Exception as e:
+            logger.exception("Failed to save session file into DB")
+            update.message.reply_text(f"تم حفظ الملف على الخادم لكن فشل حفظ نسخة في DB: {e}")
+            # continue anyway
+
+        update.message.reply_text(f"تم استقبال وحفظ الملف كـ {suggested}. سأحاول تشغيل المستمع تلقائياً...")
+
+        # try to start pyro listener
+        try:
+            ok = pyro_listener.start()
+            if ok:
+                update.message.reply_text("تم تشغيل مستمع Pyrogram باستخدام الجلسة المرفوعة ✅")
+            else:
+                update.message.reply_text("تم حفظ الجلسة لكن Pyrogram لم يبدأ تلقائياً — تأكد من API_ID/API_HASH محفوظين (استخدم /setapi).")
+        except Exception as e:
+            logger.exception("Error starting pyro after upload")
+            update.message.reply_text(f"الملف حفظ لكن حدث خطأ عند تشغيل المستمع: {e}")
 
     def _telethon_send_code(self, api_id, api_hash, phone):
         async def _send():
-            # نستخدم session مؤقت لطلب الكود
+            # kept for compatibility but may not be used when uploading session
             client = TelegramClient(os.path.join(SESSIONS_DIR, "tmp_send"), api_id, api_hash)
             await client.connect()
             try:
                 sent = await client.send_code_request(phone)
                 phone_code_hash = None
-                # Telethon قد يُعيد phone_code_hash كـ attribute
                 if hasattr(sent, 'phone_code_hash'):
                     phone_code_hash = sent.phone_code_hash
-                # بعض نسخ Telethon قد تعيد sent.phone_code.hash أو sent.phone_code.hash.value
-                # نتحرّى أيضاً داخل الخصائص المتاحة
                 elif hasattr(sent, 'phone_code') and hasattr(sent.phone_code, 'phone_code_hash'):
                     phone_code_hash = sent.phone_code.phone_code_hash
                 await client.disconnect()
@@ -464,10 +448,7 @@ class BotManager:
             try:
                 if code:
                     try:
-                        # إذا توافر phone_code_hash نمرّره (بعض نسخ Telethon تدعمه)
                         if phone_code_hash:
-                            # Telethon قد يقبل sign_in(phone=..., code=..., phone_code_hash=...)
-                            # نحاول تمرير الـ hash لتجنب الخطأ "need phone_code_hash"
                             await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
                         else:
                             await client.sign_in(phone=phone, code=code)
@@ -475,7 +456,6 @@ class BotManager:
                         await client.disconnect()
                         return {"ok": False, "password_needed": True}
                     except Exception as e:
-                        # في حالة فشل sign_in حاول إظهار الخطأ الكامل
                         await client.disconnect()
                         return {"ok": False, "error": str(e)}
                 elif password:
@@ -496,6 +476,7 @@ class BotManager:
                     pass
                 return {"ok": False, "error": str(e)}
         return asyncio.run(_signin())
+
 bot_manager = BotManager()
 
 # ----------------- Pyrogram Listener -----------------
