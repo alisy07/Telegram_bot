@@ -137,7 +137,7 @@ def telegram_webhook():
     return "OK", 200
 
 
-if __name__ == __"main__":
+if __name__ == "__main__":
     import asyncio
 
     async def run_bot():
