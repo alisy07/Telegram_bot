@@ -137,10 +137,16 @@ def telegram_webhook():
     return "OK", 200
 
 
-if __name__ == "__main__":
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=10000,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-    )
+if __name__ == __"main__":
+    import asyncio
+
+    async def run_bot():
+        await application.initialize()
+        await application.start()
+        print("Bot is running with Flask webhook...")
+
+    # تشغيل البوت
+    asyncio.get_event_loop().run_until_complete(run_bot())
+
+    # تشغيل Flask
+    app.run(host="0.0.0.0", port=10000)
