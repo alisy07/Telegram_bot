@@ -1,7 +1,7 @@
 {
     "admin_telegram_id": 1037850299,
     "bot_token_env_name": "BOT_TOKEN",
-    "db_url_env_name": "DATABASE_URL",
+    "db_url_env_name": "postgresql://ali07:OWFX881gIe9ZygrIbjWbNNlJK7YMVPT0@dpg-d4p24k7gi27c73ef8q2g-a/chance07",
     "listen_port": 10000,
     "webhook_url": ""
 }
