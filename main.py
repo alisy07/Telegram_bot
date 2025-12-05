@@ -29,6 +29,21 @@ ADMIN_ID = int(cfg.get("admin_telegram_id", 0))
 BOT_TOKEN = os.environ.get(cfg["bot_token_env_name"])
 DB_URL = os.environ.get(cfg["db_url_env_name"])
 
+DB_URL = os.getenv("DB_URL")
+
+print("\n==============================")
+print("DB_URL READ FROM ENV:", DB_URL)
+print("==============================\n")
+
+if not DB_URL:
+    raise Exception("❌ DB_URL is EMPTY or NOT FOUND in Render environment.")
+
+# تصحيح البروتوكول
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
+conn = psycopg2.connect(DB_URL)
+
 # -------------------------------
 # اتصال قاعدة البيانات
 # -------------------------------
