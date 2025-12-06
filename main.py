@@ -1,23 +1,21 @@
 import os
 import base64
 import logging
-import asyncio
-from flask import Flask, request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters
 )
 
 logging.basicConfig(level=logging.INFO)
 
-# ============================
-# إعدادات الملفات
-# ============================
+# ========= ملفات =========
 SESSIONS_DIR = "sessions"
 CHANNELS_FILE = "channels.txt"
 
@@ -25,9 +23,8 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 if not os.path.exists(CHANNELS_FILE):
     open(CHANNELS_FILE, "w").close()
 
-# ============================
-# لوحة التحكم
-# ============================
+
+# ========= لوحة التحكم =========
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 رفع جلسة", callback_data="upload_session")],
@@ -36,53 +33,55 @@ def main_menu():
         [InlineKeyboardButton("📁 عرض الجلسات", callback_data="list_sessions")],
     ])
 
-# ============================
-# الأوامر
-# ============================
+
+# ========= أوامر =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("مرحباً! اختر من القائمة:", reply_markup=main_menu())
 
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def pressed_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
     if q.data == "upload_session":
         context.user_data["mode"] = "upload_session"
-        await q.edit_message_text("🟦 أرسل الآن ملف session.")
+        await q.edit_message_text("🟦 أرسل الآن ملف الجلسة.")
     
     elif q.data == "add_channel":
         context.user_data["mode"] = "add_channel"
-        await q.edit_message_text("أرسل معرف القناة (مثل: @mychannel).")
+        await q.edit_message_text("أرسل معرف القناة مثل @example")
 
     elif q.data == "list_channels":
-        data = open(CHANNELS_FILE).read().strip()
-        msg = "لا توجد قنوات." if not data else "📜 القنوات:\n" + "\n".join(f"- {x}" for x in data.splitlines())
+        text = open(CHANNELS_FILE).read().strip()
+        msg = "لا توجد قنوات." if not text else "📜 القنوات:\n" + text.replace("\n", "\n- ")
         await q.edit_message_text(msg, reply_markup=main_menu())
 
     elif q.data == "list_sessions":
         files = os.listdir(SESSIONS_DIR)
-        msg = "لا توجد جلسات." if not files else "📁 الجلسات:\n" + "\n".join(f"- {x}" for x in files)
+        msg = "لا توجد جلسات." if not files else "📁 الجلسات:\n- " + "\n- ".join(files)
         await q.edit_message_text(msg, reply_markup=main_menu())
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = context.user_data.get("mode")
 
-    if mode == "add_channel":
-        ch = update.message.text.strip()
-        if not ch.startswith("@"):
-            await update.message.reply_text("❌ يجب أن يبدأ بـ @")
-            return
-        
-        with open(CHANNELS_FILE, "a") as f:
-            f.write(ch + "\n")
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("mode") != "add_channel":
+        return
 
-        await update.message.reply_text("✔️ تم حفظ القناة!", reply_markup=main_menu())
-        context.user_data["mode"] = None
+    ch = update.message.text.strip()
+    if not ch.startswith("@"):
+        await update.message.reply_text("❌ يجب أن يبدأ بـ @")
+        return
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with open(CHANNELS_FILE, "a") as f:
+        f.write(ch + "\n")
+
+    await update.message.reply_text("✔️ تمت إضافة القناة!", reply_markup=main_menu())
+    context.user_data["mode"] = None
+
+
+async def file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("mode") != "upload_session":
         return
-    
+
     file = await update.message.document.get_file()
     raw = await file.download_as_bytearray()
     encoded = base64.b64encode(raw).decode()
@@ -94,45 +93,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✔️ تم حفظ الجلسة!", reply_markup=main_menu())
     context.user_data["mode"] = None
 
-# ============================
-# تهيئة Telegram
-# ============================
+
+# ========= تشغيل Webhook بدون Flask =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")    # بدون /token
 
-app = Flask(__name__)
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-application = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(pressed_button))
+    app.add_handler(MessageHandler(filters.Document.ALL, file_upload))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(handle_buttons))
-application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-
-# ============================
-# Webhook Route
-# ============================
-@app.post(f"/{BOT_TOKEN}")
-def webhook():
-    json_data = request.get_json(force=True)
-    update = Update.de_json(json_data, application.bot)
-
-    asyncio.get_event_loop().create_task(application.process_update(update))
-
-    return "OK", 200
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=10000,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"   # <-- مهم جداً
+    )
 
 
-# ============================
-# تشغيل التطبيق
-# ============================
 if __name__ == "__main__":
-    async def run():
-        await application.initialize()
-        await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-        print("Webhook set successfully")
-
-    asyncio.run(run())
-
-    print("Flask server running...")
-    app.run(host="0.0.0.0", port=10000)
+    main()
