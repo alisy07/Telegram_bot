@@ -282,7 +282,7 @@ class PyroListener:
         self.loop = loop
 
         client = Client(
-            session_name=session_path,  # path to .session file (pyrogram يدعم ذلك)
+            session_path,  # path to .session file (pyrogram يدعم ذلك)
             api_id=api_id,
             api_hash=api_hash,
             workdir=SESSIONS_DIR  # للتخزين المؤقت إن لزم
