@@ -1,7 +1,7 @@
 Flask
 pyrogram==2.0.104
 tgcrypto==1.2.5
-python-telegram-bot==20.8
+python-telegram-bot[webhooks]==20.7
 requests
 Werkzeug==2.3.6
 telethon==1.28.0
