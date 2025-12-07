@@ -20,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-from pyrogram import Client, filters as py_filters
+from pyrogram import Client, errors as py_errors, filters as py_filters
 from pyrogram.handlers import MessageHandler as PyroMessageHandler
 
 # ---------------- Config ----------------
@@ -210,6 +210,26 @@ class PyroListener:
         self.session_user_id = session_user_id
         self.session_name = os.path.basename(session_path)
 
+        # DEBUG: print session path info to logs
+        try:
+            logger.info("Attempting to start Pyrogram client using session path: %s", session_path)
+            logger.info("Session file exists: %s", os.path.exists(session_path))
+            if os.path.exists(session_path):
+                try:
+                    logger.info("Session size (bytes): %s", os.path.getsize(session_path))
+                except Exception:
+                    logger.debug("Could not stat session file size.")
+        except Exception:
+            pass
+
+        # Ensure session file exists and is non-empty.
+        if not os.path.exists(session_path) or os.path.getsize(session_path) == 0:
+            logger.error(
+                "Session file missing or empty (%s). Pyrogram will not attempt interactive login in headless environment.",
+                session_path,
+            )
+            return
+
         # use session_path as client name (ensures file is created in a writable place)
         client = Client(session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
         self.client = client
@@ -262,11 +282,20 @@ class PyroListener:
 
         client.add_handler(PyroMessageHandler(on_message, py_filters.all))
 
+        # Start the client but guard against interactive prompts (EOFError) and storage errors.
         try:
+            # run_until_complete will raise if Pyrogram tries to ask for stdin (authorization)
             loop.run_until_complete(client.start())
             self.running = True
             logger.info("Pyrogram client started for user %s monitoring %s", session_user_id, self.monitored_channels)
             loop.run_until_complete(client.idle())
+        except EOFError:
+            # Pyrogram attempted interactive login (asking phone/token) -> headless environment can't provide it
+            logger.error("Pyrogram attempted interactive authorization (asked for phone/token). Session is probably invalid or incomplete. Aborting start.")
+        except py_errors.RPCError as rpc_e:
+            logger.exception("Pyrogram RPC error while starting: %s", rpc_e)
+        except sqlite3.OperationalError as sql_e:
+            logger.exception("SQLite OperationalError while Pyrogram opening session DB: %s", sql_e)
         except Exception:
             logger.exception("Pyrogram client error")
         finally:
@@ -541,6 +570,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok = pyro_listener.start_with_session_row(last)
             if ok:
                 await update.message.reply_text("🔁 تم تشغيل المستمع باستخدام آخر جلسة.", reply_markup=main_menu())
+            else:
+                await update.message.reply_text("⚠️ فشل تشغيل المستمع — تأكد من إضافة api_id/api_hash لصاحب الجلسة.", reply_markup=main_menu())
         return
 
     # awaiting channel
