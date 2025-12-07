@@ -322,7 +322,7 @@ async def complete_pyro_login(update, context):
     code = context.user_data.get("code")
     phone = context.user_data.get("phone")
     try:
-        await client.sign_in(phone, code)
+        await client.sign_in(phone_number=phone, phone_code=code)
         await client.disconnect()
         # move temp.session -> listener.session
         src = os.path.join(SESSIONS_DIR, "temp.session")
