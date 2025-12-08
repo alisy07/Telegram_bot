@@ -26,17 +26,20 @@ from pyrogram.handlers import MessageHandler as PyroMessageHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ensure set in env
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # required
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # optional
 PORT = int(os.environ.get("PORT", 10000))
 
-ADMIN_ID = 1037850299  # update if needed
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "1037850299"))  # change if needed
 
 # paths
-DB_FILE = "bot_data.db"
-SESSIONS_DIR = "/opt/render/project/src/sessions"  # fixed directory per your request
+BASE_DIR = os.getcwd()
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.path.join(DATA_DIR, "database.db")
+SESSIONS_DIR = "/opt/render/project/src/sessions"  # fixed path requested
 os.makedirs(SESSIONS_DIR, exist_ok=True)
-SESSION_FILE = os.path.join(SESSIONS_DIR, "listener.session")  # final session path used by listener
+SESSION_FILE = os.path.join(SESSIONS_DIR, "listener.session")  # final session path
 
 # ---------------- Database helpers ----------------
 def init_db():
@@ -54,7 +57,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             channel_username TEXT,
-            target_bot_username TEXT
+            target_bots TEXT
         )
     """)
     cur.execute("""
@@ -62,7 +65,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             filename TEXT,
-            data_b64 TEXT
+            data_b64 TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -87,10 +91,49 @@ def get_api(user_id: int) -> Optional[Tuple[str, str]]:
     conn.close()
     return (row[0], row[1]) if row else None
 
+def add_channel_db(user_id: int, channel: str, target_bots_csv: str):
+    """
+    target_bots_csv: comma separated list of bot usernames (with or without @)
+    """
+    # normalize list: remove spaces, ensure leading @, join with comma
+    bots = [b.strip() for b in target_bots_csv.split(",") if b.strip()]
+    bots = [("@" + b.lstrip("@")) for b in bots]
+    normalized = ",".join(bots)
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO channels(user_id, channel_username, target_bots) VALUES(?,?,?)",
+                (user_id, channel, normalized))
+    conn.commit()
+    conn.close()
+
+def list_channels_db(user_id: int) -> List[Tuple[int, str, str]]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT id, channel_username, target_bots FROM channels WHERE user_id = ?", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def list_all_channels_db() -> List[Tuple[int, int, str, str]]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, channel_username, target_bots FROM channels")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def delete_channel_db(channel_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
 def save_session_db(user_id: int, filename: str, data_b64: str):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("INSERT INTO sessions(user_id, filename, data_b64) VALUES(?,?,?)", (user_id, filename, data_b64))
+    cur.execute("INSERT INTO sessions(user_id, filename, data_b64) VALUES(?,?,?)",
+                (user_id, filename, data_b64))
     conn.commit()
     conn.close()
 
@@ -118,36 +161,6 @@ def list_all_sessions_db() -> List[Tuple[int, int, str]]:
     conn.close()
     return rows
 
-def add_channel_db(user_id: int, channel: str, target_bot: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO channels(user_id, channel_username, target_bot_username) VALUES(?,?,?)", (user_id, channel, target_bot))
-    conn.commit()
-    conn.close()
-
-def list_channels_db(user_id: int) -> List[Tuple[int, str, str]]:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT id, channel_username, target_bot_username FROM channels WHERE user_id = ?", (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def list_all_channels_db() -> List[Tuple[int, int, str, str]]:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT id, user_id, channel_username, target_bot_username FROM channels")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def delete_channel_db(channel_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
-
 def get_all_user_ids() -> Set[int]:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -166,16 +179,17 @@ def list_users_db() -> List[int]:
 
 # ---------------- Filtering ----------------
 def filter_text_preserve_rules(text: str) -> str:
-    # remove Arabic letters
+    # 1) remove Arabic chars
     text = re.sub(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]', '', text)
-    # remove 'code' case-insensitive
+    # 2) remove 'code' (case-insensitive)
     text = re.sub(r'(?i)code', '', text)
-    # remove links
+    # 3) remove links
     text = re.sub(r'(https?://\S+)|www\.\S+|t\.me/\S+|telegram\.me/\S+', '', text)
-    # remove numbers not adjacent to ascii letters
+    # 4) remove numbers not adjacent to ascii letters
     text = re.sub(r'(?<![A-Za-z])\d+(?![A-Za-z])', '', text)
-    # remove symbols (keep underscore, alnum, whitespace)
+    # 5) remove symbols (keep underscore, alnum, whitespace)
     text = re.sub(r'[^\w\s]', '', text)
+    # 6) collapse whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     if not text:
         return "❌ لا يبقى نص قابل للإرسال بعد عملية الفلترة."
@@ -192,29 +206,30 @@ class PyroListener:
         self.session_user_id: Optional[int] = None
 
     def _write_session_file(self, filename: str, b64data: str) -> str:
-        # write original under sessions/filename and also write final listener.session
-        dest = os.path.join(SESSIONS_DIR, filename)
-        tmp_dest = dest + ".tmp"
-        with open(tmp_dest, "wb") as f:
+        # write given session bytes into SESSIONS_DIR/filename
+        path = os.path.join(SESSIONS_DIR, filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
             f.write(base64.b64decode(b64data))
-        os.replace(tmp_dest, dest)
-        # also write/replace final SESSION_FILE
-        tmp_final = SESSION_FILE + ".tmp"
-        with open(tmp_final, "wb") as f:
-            f.write(base64.b64decode(b64data))
-        os.replace(tmp_final, SESSION_FILE)
+        # also make sure listener.session path points to this file name
+        # if user uploaded a custom name, copy/replace listener.session
+        try:
+            os.replace(path, SESSION_FILE)
+            # keep a copy under original name too (optional)
+            with open(SESSION_FILE, "rb") as srcf:
+                with open(os.path.join(SESSIONS_DIR, filename), "wb") as dstf:
+                    dstf.write(srcf.read())
+        except Exception:
+            # if rename fails, still return path
+            pass
         return SESSION_FILE
 
     def _pyro_thread_target(self, session_path: str, api_id: int, api_hash: str, session_user_id: int):
-        """
-        Run Pyrogram client in separate thread + event loop
-        """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self.loop = loop
         self.session_user_id = session_user_id
 
-        # create client; pass session path as first positional arg (works across pyrogram versions)
         client = Client(session_path, api_id=api_id, api_hash=api_hash, workdir=SESSIONS_DIR)
         self.client = client
 
@@ -230,7 +245,7 @@ class PyroListener:
                     ch_username = "@" + ch_username
                 if ch_username not in self.monitored_channels:
                     return
-                # ignore media (per your rule)
+                # ignore media
                 if getattr(m, "photo", None) or getattr(m, "video", None) or getattr(m, "document", None) or getattr(m, "audio", None) or getattr(m, "animation", None) or getattr(m, "voice", None) or getattr(m, "sticker", None):
                     logger.debug("Ignoring media from %s", ch_username)
                     return
@@ -240,23 +255,31 @@ class PyroListener:
                 filtered = filter_text_preserve_rules(raw_text)
                 if filtered.startswith("❌"):
                     return
-                # lookup target bot for this channel and session owner
+                # get target bots for this channel (may be multiple, csv)
                 conn = sqlite3.connect(DB_FILE)
                 cur = conn.cursor()
-                cur.execute("SELECT target_bot_username FROM channels WHERE user_id = ? AND channel_username = ? LIMIT 1", (session_user_id, ch_username))
-                row = cur.fetchone()
+                cur.execute("SELECT target_bots FROM channels WHERE user_id = ? AND channel_username = ?",
+                            (session_user_id, ch_username))
+                rows = cur.fetchall()
                 conn.close()
-                if not row:
-                    logger.info("No target configured for %s", ch_username)
+                if not rows:
+                    logger.info("No configured target bots for %s", ch_username)
                     return
-                target_bot = row[0]
-                if not target_bot.startswith("@"):
-                    target_bot = "@" + target_bot
-                try:
-                    await c.send_message(target_bot, filtered)
-                    logger.info("Forwarded filtered text from %s to %s", ch_username, target_bot)
-                except Exception:
-                    logger.exception("Failed to send message to target bot %s", target_bot)
+                # rows may contain multiple entries (if user added same channel twice) -> collect all bots
+                targets = []
+                for r in rows:
+                    if r and r[0]:
+                        parts = [p.strip() for p in r[0].split(",") if p.strip()]
+                        parts = [("@" + p.lstrip("@")) for p in parts]
+                        targets.extend(parts)
+                # unique targets
+                targets = list(dict.fromkeys(targets))
+                for tb in targets:
+                    try:
+                        await c.send_message(tb, filtered)
+                        logger.info("Forwarded from %s -> %s", ch_username, tb)
+                    except Exception:
+                        logger.exception("Failed to send to %s", tb)
             except Exception:
                 logger.exception("on_message handler error")
 
@@ -268,7 +291,7 @@ class PyroListener:
             logger.info("Pyrogram client started for user %s monitoring %s", session_user_id, self.monitored_channels)
             loop.run_until_complete(client.idle())
         except EOFError:
-            logger.error("Pyrogram attempted interactive authorization (asked for phone/token). Session invalid or incomplete.")
+            logger.error("Pyrogram attempted interactive authorization (asked for phone/token). Session invalid/incomplete.")
         except py_errors.RPCError as rpc_e:
             logger.exception("Pyrogram RPC error while starting: %s", rpc_e)
         except sqlite3.OperationalError as sql_e:
@@ -285,8 +308,8 @@ class PyroListener:
 
     def start_with_session_row(self, session_row) -> bool:
         """
-        session_row: (id,user_id,filename,data_b64)
-        writes session to disk (listener.session) and starts listener if api exists.
+        Accepts a session row (id,user_id,filename,data_b64),
+        writes session file to listener.session and starts.
         """
         if not session_row:
             return False
@@ -296,10 +319,9 @@ class PyroListener:
             logger.error("No API credentials for session owner %s", user_id)
             return False
         api_id, api_hash = api
-        # write session file(s)
-        session_path = self._write_session_file(filename, data_b64)
-        # start thread
-        return self.start_with_session_file(session_path, int(api_id), api_hash, user_id)
+        # write session file bytes into SESSION_FILE
+        written_path = self._write_session_file(filename, data_b64)
+        return self.start_with_session_file(written_path, int(api_id), api_hash, user_id)
 
     def start_with_session_file(self, session_path: str, api_id: int, api_hash: str, session_user_id: int):
         # stop existing
@@ -315,7 +337,7 @@ class PyroListener:
                 mon.add(ch)
         self.monitored_channels = mon
         self.session_user_id = session_user_id
-        # spawn thread
+        # start the thread
         t = threading.Thread(target=self._pyro_thread_target, args=(session_path, api_id, api_hash, session_user_id), daemon=True)
         t.start()
         self.thread = t
@@ -356,10 +378,9 @@ def main_menu():
         [InlineKeyboardButton("📤 رفع جلسة", callback_data="upload_session")],
         [InlineKeyboardButton("➕ إضافة قناة", callback_data="add_channel")],
         [InlineKeyboardButton("🗑️ حذف قناة", callback_data="delete_channel")],
-        [InlineKeyboardButton("📜 عرض قنواتي", callback_data="list_channels")],
+        [InlineKeyboardButton("📜 عرض القنوات", callback_data="list_channels")],
         [InlineKeyboardButton("🔐 إضافة API", callback_data="add_api")],
         [InlineKeyboardButton("👀 عرض API", callback_data="view_api")],
-        [InlineKeyboardButton("📁 عرض الجلسات", callback_data="list_sessions")],
         [InlineKeyboardButton("🔁 إعادة تشغيل المستمع", callback_data="restart_listener")],
     ])
 
@@ -369,6 +390,8 @@ def admin_menu():
         [InlineKeyboardButton("🔐 عرض كل APIs", callback_data="admin_list_apis")],
         [InlineKeyboardButton("📜 عرض كل القنوات", callback_data="admin_list_channels")],
         [InlineKeyboardButton("📁 عرض كل الجلسات", callback_data="admin_list_sessions")],
+        [InlineKeyboardButton("📢 بث رسالة", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("📊 إحصائيات", callback_data="admin_stats")],
     ])
 
 async def safe_edit(query, text, markup=None):
@@ -396,26 +419,26 @@ async def pressed_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data_cb = q.data
 
-    # upload session start
+    # upload session flow
     if data_cb == "upload_session":
         context.user_data["awaiting_session"] = True
-        await safe_edit(q, "📤 أرسل الآن ملف الجلسة (.session) كوثيقة.", main_menu())
+        await safe_edit(q, "📤 أرسل الآن ملف الجلسة (.session) كوثيقة. بعد الرفع سيتم حفظه ك /sessions/listener.session", main_menu())
         return
 
-    # add channel: user will send "<@channel> <@target_bot>"
+    # add channel: format -> @channel @bot1,@bot2
     if data_cb == "add_channel":
         context.user_data["awaiting_channel"] = True
-        await safe_edit(q, "➕ أرسل الآن: @channel_username @target_bot_username", main_menu())
+        await safe_edit(q, "➕ أرسل الآن: @channel_username @target_bot1,@target_bot2 (يمكن أكثر من بوت مفصولين بفاصلة)", main_menu())
         return
 
-    # delete channel (list user's channels)
+    # delete channel list
     if data_cb == "delete_channel":
         rows = list_channels_db(uid)
         if not rows:
-            await safe_edit(q, "❌ لا توجد قنوات للحذف.", main_menu())
+            await safe_edit(q, "❌ لا توجد قنوات لحذفها.", main_menu())
             return
-        buttons = [[InlineKeyboardButton(f"{r[1]} → {r[2]}", callback_data=f"del:{r[0]}")] for r in rows]
-        await safe_edit(q, "اختر القناة للحذف:", InlineKeyboardMarkup(buttons))
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"{r[1]} -> {r[2]}", callback_data=f"del:{r[0]}")] for r in rows])
+        await safe_edit(q, "اختر قناة للحذف:", kb)
         return
 
     if data_cb and data_cb.startswith("del:"):
@@ -448,12 +471,12 @@ async def pressed_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data_cb == "view_api":
         api = get_api(uid)
         if not api:
-            await safe_edit(q, "❌ لم تُسجّل API بعد.", main_menu())
+            await safe_edit(q, "❌ لم تقم بتسجيل API بعد.", main_menu())
         else:
             await safe_edit(q, f"🔐 api_id: `{api[0]}`\napi_hash: `{api[1]}`", main_menu())
         return
 
-    # list sessions (user's sessions)
+    # list sessions
     if data_cb == "list_sessions":
         rows = list_sessions_db(uid)
         if not rows:
@@ -463,7 +486,7 @@ async def pressed_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, text, main_menu())
         return
 
-    # restart listener using last session (if api exists)
+    # restart listener (use last session)
     if data_cb == "restart_listener":
         last = get_last_session_row()
         if not last:
@@ -473,8 +496,8 @@ async def pressed_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not api:
             await safe_edit(q, "❌ لا توجد API مسجلة لصاحب الجلسة.", main_menu())
             return
-        ok = pyro_listener.start_with_session_row(last)
-        if ok:
+        started = pyro_listener.start_with_session_row(last)
+        if started:
             await safe_edit(q, "🔁 تم إعادة تشغيل المستمع باستخدام آخر جلسة.", main_menu())
         else:
             await safe_edit(q, "❌ فشل تشغيل المستمع.", main_menu())
@@ -513,7 +536,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     msg_text = (update.message.text or "").strip()
 
-    # awaiting upload session (document)
+    # upload session (document)
     if context.user_data.get("awaiting_session"):
         doc = update.message.document
         if not doc:
@@ -523,48 +546,52 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_obj = await doc.get_file()
         raw = await file_obj.download_as_bytearray()
         b64 = base64.b64encode(raw).decode()
-        filename = doc.file_name or "listener.session"
+        filename = doc.file_name
         save_session_db(uid, filename, b64)
-        # write both original filename copy and final listener.session (atomic)
+        # write file to sessions dir and set as listener.session
         try:
-            pyro_listener._write_session_file(filename, b64)
+            local_path = os.path.join(SESSIONS_DIR, filename)
+            with open(local_path, "wb") as f:
+                f.write(base64.b64decode(b64))
+            # ensure final listener.session path set (overwrite)
+            try:
+                os.replace(local_path, SESSION_FILE)
+            except Exception:
+                # fallback: copy
+                with open(local_path, "rb") as sf:
+                    with open(SESSION_FILE, "wb") as df:
+                        df.write(sf.read())
         except Exception:
-            logger.exception("Failed to write session files.")
-            await update.message.reply_text("❌ فشل حفظ الملف محلياً.", reply_markup=main_menu())
-            context.user_data["awaiting_session"] = False
-            return
+            logger.exception("Failed to write session file locally.")
         context.user_data["awaiting_session"] = False
-        await update.message.reply_text("✔️ تم حفظ الجلسة في قاعدة البيانات وتم وضعها في مسار sessions/.", reply_markup=main_menu())
-        # auto-start if api exists for uploader
+        await update.message.reply_text("✔️ تم حفظ الجلسة في قاعدة البيانات وسجلت محلياً ك listener.session.", reply_markup=main_menu())
+        # auto-start listener if API present for uploader
         api = get_api(uid)
-        last = get_last_session_row()
-        if api and last:
-            started = pyro_listener.start_with_session_row(last)
-            if started:
+        if api:
+            try:
+                pyro_listener.start_with_session_file(SESSION_FILE, int(api[0]), api[1], uid)
                 await update.message.reply_text("🔁 تم تشغيل المستمع باستخدام الجلسة المرفوعة.", reply_markup=main_menu())
-            else:
-                await update.message.reply_text("⚠️ لم أتمكن من تشغيل المستمع: تحقق من صلاحية الجلسة وبيانات API.", reply_markup=main_menu())
+            except Exception:
+                logger.exception("Failed to start listener after upload.")
         return
 
-    # awaiting add channel
+    # add channel flow
     if context.user_data.get("awaiting_channel"):
         parts = msg_text.split(None, 1)
         if len(parts) != 2:
-            await update.message.reply_text("❌ الصيغة خاطئة. أرسل: @channel_username @target_bot_username", reply_markup=main_menu())
+            await update.message.reply_text("❌ الصيغة خاطئة. أرسل: @channel_username @target_bot1,@target_bot2", reply_markup=main_menu())
             context.user_data["awaiting_channel"] = False
             return
-        channel, target = parts
+        channel, targets = parts
         if not channel.startswith("@"):
             channel = "@" + channel
-        if not target.startswith("@"):
-            target = "@" + target
-        add_channel_db(uid, channel, target)
+        add_channel_db(uid, channel, targets)
         context.user_data["awaiting_channel"] = False
         pyro_listener.reload_monitored_channels_for_current_session()
-        await update.message.reply_text(f"✔️ تم إضافة القناة {channel} -> {target}", reply_markup=main_menu())
+        await update.message.reply_text(f"✔️ تم إضافة القناة {channel} مع البوتات {targets}", reply_markup=main_menu())
         return
 
-    # awaiting api
+    # add api flow
     if context.user_data.get("awaiting_api"):
         parts = msg_text.split(None, 1)
         if len(parts) != 2:
@@ -577,7 +604,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✔️ تم حفظ API_ID و API_HASH.", reply_markup=main_menu())
         return
 
-    # default fallback
+    # default
     await update.message.reply_text("استخدم الأزرار للتنقل أو /start لعرض القائمة.", reply_markup=main_menu())
 
 # ----------------- Start bot -----------------
@@ -589,19 +616,18 @@ def main():
     app.add_handler(CallbackQueryHandler(pressed_button))
     app.add_handler(MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), text_message))
 
-    # try to start listener using last saved session (if api exists)
+    # try to start Pyrogram listener at startup using last saved session row (if any)
     last = get_last_session_row()
     if last:
         api = get_api(last[1])
         if api:
             try:
-                started = pyro_listener.start_with_session_row(last)
-                if started:
-                    logger.info("Started Pyrogram listener at startup using last session.")
+                pyro_listener.start_with_session_row(last)
+                logger.info("Started Pyrogram listener at startup using last session.")
             except Exception:
                 logger.exception("Failed to start PyroListener at startup.")
 
-    # choose webhook or polling
+    # webhook or polling
     if WEBHOOK_URL:
         logger.info("Starting webhook...")
         app.run_webhook(
