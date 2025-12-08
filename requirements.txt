@@ -1,5 +1,5 @@
-pyrogram==2.0.106
+pyrogram==2.0.104
 tgcrypto
-python-telegram-bot==20.6
+python-telegram-bot==20.3
 gunicorn
 aiohttp
