@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py — Webhook-ready Telegram control bot + Pyrogram listener
+# merged_main.py — دمج: phone-session creator + webhook-ready control bot + Pyrogram listener
 
 import os
 import re
@@ -8,6 +8,7 @@ import base64
 import logging
 import threading
 import asyncio
+import time
 from typing import Optional, List, Tuple, Set
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")      # required
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://yourapp.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # optional
 PORT = int(os.environ.get("PORT", 10000))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1037850299"))
 
@@ -36,6 +37,10 @@ DB_FILE = "bot_data.db"
 
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "/mnt/data/sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+# Fallback global API used if user has not saved API in DB
+GLOBAL_API_ID = os.getenv("API_ID")
+GLOBAL_API_HASH = os.getenv("API_HASH")
 
 # ---------- DB helpers ----------
 def init_db():
@@ -106,6 +111,15 @@ def get_last_session_row() -> Optional[Tuple[int, int, str, str]]:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT id, user_id, filename, data_b64 FROM sessions ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_last_session_row_for_user(user_id: int) -> Optional[Tuple[int, int, str, str]]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, filename, data_b64 FROM sessions WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -331,6 +345,7 @@ pyro_listener = PyroListener()
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 رفع جلسة", callback_data="upload_session")],
+        [InlineKeyboardButton("📱 إنشاء جلسة جديدة", callback_data="create_session")],
         [InlineKeyboardButton("➕ إضافة قناة", callback_data="add_channel")],
         [InlineKeyboardButton("🗑️ حذف قناة", callback_data="delete_channel")],
         [InlineKeyboardButton("📜 عرض القنوات", callback_data="list_channels")],
@@ -352,6 +367,12 @@ async def pressed_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.data == "upload_session":
         await q.edit_message_text("📤 أرسل ملف الجلسة (.session)")
         ctx.user_data["awaiting"] = "session_file"
+
+    elif q.data == "create_session":
+        # Start phone-based session creation flow (uses per-user ctx.user_data)
+        await q.edit_message_text("📱 *أرسل رقم الهاتف الآن*\n\nمثال:\n`+9665xxxxxxxx`", parse_mode="Markdown")
+        ctx.user_data["awaiting"] = "create_session_phone"
+        ctx.user_data["create_session_state"] = "awaiting_phone"
 
     elif q.data == "add_api":
         await q.edit_message_text("🔐 أرسل API_ID و API_HASH بهذا الشكل:\n12345:abcd1234")
@@ -411,7 +432,7 @@ async def text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     awaiting = ctx.user_data.get("awaiting")
     user = update.message.from_user.id
 
-    # Upload session file
+    # ---------- Upload session file ----------
     if awaiting == "session_file" and update.message.document:
         f = update.message.document
         if not f.file_name.endswith(".session"):
@@ -421,13 +442,191 @@ async def text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         b = await file.download_as_bytearray()
         b64 = base64.b64encode(b).decode()
         save_session_db(user, f.file_name, b64)
-        ok = pyro_listener.start_with_session_row(get_last_session_row())
-        if ok:
-            await update.message.reply_text("تم تشغيل الجلسة ✔️", reply_markup=main_menu())
+        # start the listener with this newly uploaded session (the most recent for this user)
+        row = get_last_session_row_for_user(user)
+        if row:
+            ok = pyro_listener.start_with_session_row(row)
+            if ok:
+                await update.message.reply_text("تم تشغيل الجلسة ✔️", reply_markup=main_menu())
+            else:
+                await update.message.reply_text("❌ فشل تشغيل المستمع بعد رفع الجلسة.", reply_markup=main_menu())
+        else:
+            await update.message.reply_text("تم حفظ الجلسة في DB ✔️", reply_markup=main_menu())
         ctx.user_data["awaiting"] = None
         return
 
-    # Add API
+    # ---------- Create session via phone flow ----------
+    if awaiting == "create_session_phone":
+        state = ctx.user_data.get("create_session_state")
+        # Step 1: phone number received
+        if state == "awaiting_phone":
+            phone = update.message.text.strip()
+            # get api credentials for this user or fallback to global env
+            api = get_api(user)
+            if api:
+                api_id, api_hash = api
+            else:
+                if GLOBAL_API_ID and GLOBAL_API_HASH:
+                    api_id, api_hash = GLOBAL_API_ID, GLOBAL_API_HASH
+                else:
+                    await update.message.reply_text("❌ لا يوجد API_ID/API_HASH محفوظ. استخدم /start ثم '🔐 إضافة API' أو اضبط متغيرات البيئة.")
+                    ctx.user_data["awaiting"] = None
+                    ctx.user_data.pop("create_session_state", None)
+                    return
+
+            # ensure api_id int
+            try:
+                api_id_int = int(api_id)
+            except:
+                await update.message.reply_text("❌ API_ID في DB أو env غير صحيح (غير رقمي).")
+                ctx.user_data["awaiting"] = None
+                ctx.user_data.pop("create_session_state", None)
+                return
+
+            # create a temp unique session name
+            timestamp = int(time.time())
+            session_name = f"tmp_session_{user}_{timestamp}"
+            ctx.user_data["tmp_session_name"] = session_name
+            ctx.user_data["tmp_api"] = (api_id_int, api_hash)
+            ctx.user_data["phone_number"] = phone
+            ctx.user_data["create_session_state"] = "awaiting_code"
+            await update.message.reply_text("🔄 جاري إرسال كود التحقق…")
+            # send code asynchronously
+            try:
+                tmp_client = Client(session_name, api_id=api_id_int, api_hash=api_hash, workdir=SESSIONS_DIR)
+                await tmp_client.connect()
+                # pyrogram's send_code returns sent_code. Use send_code to phone
+                await tmp_client.send_code(phone)
+                # store client in user_data to reuse (note: it's a Client object tied to this session file)
+                ctx.user_data["tmp_client"] = tmp_client
+                await update.message.reply_text("✔️ تم إرسال الكود.\n\n📩 *أرسل الكود الآن:*", parse_mode="Markdown")
+            except Exception as e:
+                logger.exception("send_code error")
+                ctx.user_data["awaiting"] = None
+                ctx.user_data.pop("create_session_state", None)
+                await update.message.reply_text(f"❌ خطأ أثناء إرسال الكود:\n`{e}`", parse_mode="Markdown")
+            return
+
+        # Step 2: code received
+        if state == "awaiting_code":
+            code = update.message.text.strip()
+            phone = ctx.user_data.get("phone_number")
+            api_id_int, api_hash = ctx.user_data.get("tmp_api", (None, None))
+            session_name = ctx.user_data.get("tmp_session_name")
+            tmp_client: Optional[Client] = ctx.user_data.get("tmp_client")
+            if not tmp_client:
+                await update.message.reply_text("❌ جلسة مؤقتة لا توجد. أعد المحاولة.")
+                ctx.user_data["awaiting"] = None
+                ctx.user_data.pop("create_session_state", None)
+                return
+            try:
+                # sign in with code
+                await tmp_client.sign_in(phone_number=phone, code=code)
+                # success — stop client to flush session file
+                await tmp_client.disconnect()
+                # read session file and save in DB
+                session_filename = f"{session_name}.session"
+                path = os.path.join(SESSIONS_DIR, session_filename)
+                if not os.path.exists(path):
+                    # pyrogram may have created session as .session in workdir with given name
+                    # if not found, try other possible names
+                    # but normally it should be present
+                    await update.message.reply_text("❌ لم يتم إنشاء ملف الجلسة.")
+                else:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    b64 = base64.b64encode(data).decode()
+                    save_session_db(user, session_filename, b64)
+                    # start listener for this user session
+                    row = get_last_session_row_for_user(user)
+                    if row:
+                        api = get_api(user)
+                        # if user didn't save API earlier, save now using tmp api used
+                        if not api:
+                            save_api(user, str(api_id_int), api_hash)
+                        ok = pyro_listener.start_with_session_row(row)
+                        if ok:
+                            await update.message.reply_text("🎉 تم تسجيل الدخول ورفع الجلسة ✅\n💾 تم تشغيل المستمع.", reply_markup=main_menu())
+                        else:
+                            await update.message.reply_text("✔️ تم حفظ الجلسة لكن فشل تشغيل المستمع.", reply_markup=main_menu())
+                    else:
+                        await update.message.reply_text("✔️ تم حفظ الجلسة.", reply_markup=main_menu())
+                # cleanup ctx.user_data
+                ctx.user_data["awaiting"] = None
+                ctx.user_data.pop("create_session_state", None)
+                # remove tmp_client ref
+                ctx.user_data.pop("tmp_client", None)
+                ctx.user_data.pop("tmp_api", None)
+                ctx.user_data.pop("tmp_session_name", None)
+                ctx.user_data.pop("phone_number", None)
+            except Exception as e:
+                logger.exception("sign_in error")
+                # handle 2FA required
+                if "SESSION_PASSWORD_NEEDED" in str(e) or isinstance(e, py_errors.SessionPasswordNeeded):
+                    ctx.user_data["create_session_state"] = "awaiting_2fa"
+                    # keep tmp_client as is
+                    await update.message.reply_text("🔐 الحساب محمي بكلمة مرور 2FA.\n➡️ *أرسل كلمة المرور الآن:*", parse_mode="Markdown")
+                else:
+                    await update.message.reply_text(f"❌ خطأ أثناء تسجيل الدخول:\n`{e}`", parse_mode="Markdown")
+                    ctx.user_data["awaiting"] = None
+                    ctx.user_data.pop("create_session_state", None)
+                    # try to disconnect client if present
+                    if tmp_client:
+                        try:
+                            await tmp_client.disconnect()
+                        except:
+                            pass
+                        ctx.user_data.pop("tmp_client", None)
+            return
+
+        # Step 3: awaiting 2FA password
+        if state == "awaiting_2fa":
+            password = update.message.text.strip()
+            tmp_client: Optional[Client] = ctx.user_data.get("tmp_client")
+            session_name = ctx.user_data.get("tmp_session_name")
+            user_api = ctx.user_data.get("tmp_api")
+            if not tmp_client:
+                await update.message.reply_text("❌ جلسة مؤقتة لا توجد. أعد المحاولة.")
+                ctx.user_data["awaiting"] = None
+                ctx.user_data.pop("create_session_state", None)
+                return
+            try:
+                await tmp_client.check_password(password)
+                await tmp_client.disconnect()
+                # write session file into DB
+                session_filename = f"{session_name}.session"
+                path = os.path.join(SESSIONS_DIR, session_filename)
+                if not os.path.exists(path):
+                    await update.message.reply_text("❌ لم يتم إنشاء ملف الجلسة بعد.")
+                else:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    b64 = base64.b64encode(data).decode()
+                    save_session_db(user, session_filename, b64)
+                    row = get_last_session_row_for_user(user)
+                    if row:
+                        api_record = get_api(user)
+                        if not api_record and user_api:
+                            save_api(user, str(user_api[0]), user_api[1])
+                        ok = pyro_listener.start_with_session_row(row)
+                        if ok:
+                            await update.message.reply_text("🎉 تسجيل الدخول ناجح!\n💾 تم إنشاء وتفعيل الجلسة.", reply_markup=main_menu())
+                        else:
+                            await update.message.reply_text("✔️ تم حفظ الجلسة لكن فشل تشغيل المستمع.", reply_markup=main_menu())
+                    else:
+                        await update.message.reply_text("✔️ تم حفظ الجلسة.", reply_markup=main_menu())
+                ctx.user_data["awaiting"] = None
+                ctx.user_data.pop("create_session_state", None)
+                ctx.user_data.pop("tmp_client", None)
+                ctx.user_data.pop("tmp_api", None)
+                ctx.user_data.pop("tmp_session_name", None)
+                ctx.user_data.pop("phone_number", None)
+            except Exception as e:
+                logger.exception("2fa error")
+                await update.message.reply_text(f"❌ كلمة المرور خاطئة أو فشل:\n`{e}`", parse_mode="Markdown")
+            return
+
+    # ---------- Add API ----------
     if awaiting == "api_data":
         if ":" not in update.message.text:
             await update.message.reply_text("❌ التنسيق خاطئ")
@@ -438,7 +637,7 @@ async def text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["awaiting"] = None
         return
 
-    # Add channel
+    # ---------- Add channel ----------
     if awaiting == "add_channel":
         parts = update.message.text.split()
         if len(parts) != 2:
@@ -451,12 +650,18 @@ async def text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["awaiting"] = None
         return
 
+    # Fallback: show menu
     await update.message.reply_text("اختر من القائمة:", reply_markup=main_menu())
 
 
-# ---------- MAIN (webhook) ----------
+# ---------- MAIN ----------
 def main():
     init_db()
+
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is required in environment")
+        print("❌ BOT_TOKEN يجب أن يكون موجوداً في متغيرات البيئة.")
+        return
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -464,12 +669,13 @@ def main():
     application.add_handler(CallbackQueryHandler(pressed_button))
     application.add_handler(MessageHandler(filters.ALL, text_message))
 
+    # try to start last session if exists
     last = get_last_session_row()
     if last:
         try:
             pyro_listener.start_with_session_row(last)
         except:
-            logger.exception("listener failed")
+            logger.exception("listener failed to start with last session")
 
     if WEBHOOK_URL:
         application.run_webhook(
